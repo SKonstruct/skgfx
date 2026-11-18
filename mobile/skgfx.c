@@ -71,6 +71,9 @@ static int hud_effective(int nw, int nh) {
 }
 
 void skgfx_set_config(int enabled, float scale, float sharpen, int hud) {
+    // A NaN passes every comparison below and would reach an int cast (undefined behaviour): use the defaults.
+    if (scale != scale) scale = 1.0f;
+    if (sharpen != sharpen) sharpen = 0.0f;
     if (scale < 0.25f) scale = 0.25f;
     if (scale > 1.0f) scale = 1.0f;
     if (sharpen < 0.0f) sharpen = 0.0f;
@@ -82,7 +85,10 @@ void skgfx_set_config(int enabled, float scale, float sharpen, int hud) {
 }
 
 void skgfx_believed_size(int nw, int nh, int *bw, int *bh) {
-    if (!atomic_load(&cfg_enabled) || atomic_load(&cfg_failed)) {
+    if (!bw || !bh) return;
+    // A surface that is gone or not laid out yet reports 0 x 0: there is nothing to scale, so the platform's own
+    // numbers are returned unchanged (scaled_dim would turn 0 into 1 and the scale factor into infinity).
+    if (nw <= 0 || nh <= 0 || !atomic_load(&cfg_enabled) || atomic_load(&cfg_failed)) {
         *bw = nw;
         *bh = nh;
         return;
@@ -170,7 +176,7 @@ static const char *CAS_SRC =
     "  vec3 h = texture2D(uTex, vUv + vec2(0.0, uTexel.y)).rgb;\n"
     "  vec3 mn = min(min(min(d, e), min(f, b)), h);\n"
     "  vec3 mx = max(max(max(d, e), max(f, b)), h);\n"
-    "  vec3 amp = clamp(min(mn, 2.0 - mx) / (mx + 1e-5), 0.0, 1.0);\n"
+    "  vec3 amp = clamp(min(mn, 1.0 - mx) / (mx + 1e-5), 0.0, 1.0);\n"
     "  amp = sqrt(amp);\n"
     "  float peak = -1.0 / mix(8.0, 5.0, uSharp);\n"
     "  vec3 w = amp * peak;\n"
@@ -385,6 +391,9 @@ static void fail(unsigned window_fbo, const char *why) {
 
 static void reconfigure(unsigned window_fbo, int nw, int nh) {
     if (!g.ready) return;
+    // A surface of 0 x 0 (backgrounded, mid-rotation) is not a size to build targets for; the next frame's size
+    // is. Nothing changes until then.
+    if (nw <= 0 || nh <= 0) return;
     if (!atomic_load(&cfg_enabled) || atomic_load(&cfg_failed)) {
         if (g.engaged) disengage(window_fbo);
         return;
@@ -424,6 +433,10 @@ typedef struct {
 } saved_t;
 
 static void save_state(saved_t *s) {
+    // Defaults for what a failed query leaves untouched, so restore_state never replays garbage.
+    s->a0_size = 4;
+    s->a0_type = GL_FLOAT;
+    s->active_tex = GL_TEXTURE0;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s->fbo);
     glGetIntegerv(GL_CURRENT_PROGRAM, &s->prog);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s->array_buf);
@@ -446,6 +459,7 @@ static void save_state(saved_t *s) {
     glGetBooleanv(GL_COLOR_WRITEMASK, s->cmask);
     glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &s->max_attribs);
     if (s->max_attribs > MAX_ATTRIBS) s->max_attribs = MAX_ATTRIBS;
+    if (s->max_attribs < 0) s->max_attribs = 0;
     for (int i = 0; i < s->max_attribs; i++) glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &s->attrib_on[i]);
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &s->a0_size);
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &s->a0_type);
@@ -458,7 +472,8 @@ static void save_state(saved_t *s) {
 static void restore_state(const saved_t *s) {
     // Vertex attribute 0 first (it needs its own buffer bound while the pointer is set).
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)s->a0_buf);
-    glVertexAttribPointer(0, s->a0_size, (GLenum)s->a0_type, (GLboolean)s->a0_norm, s->a0_stride, s->a0_ptr);
+    if (s->a0_size >= 1 && s->a0_size <= 4)
+        glVertexAttribPointer(0, s->a0_size, (GLenum)s->a0_type, (GLboolean)s->a0_norm, s->a0_stride, s->a0_ptr);
     for (int i = 0; i < s->max_attribs; i++) {
         if (s->attrib_on[i]) glEnableVertexAttribArray(i); else glDisableVertexAttribArray(i);
     }
@@ -508,8 +523,9 @@ static void draw_quad(GLuint prog, GLuint tex) {
 
 int skgfx_present(unsigned window_fbo, int nw, int nh) {
     atomic_fetch_add(&frame_count, 1);
-    if (!g.ready || !g.engaged) return 0;
+    if (!g.ready || !g.engaged || nw <= 0 || nh <= 0) return 0;
     saved_t s;
+    memset(&s, 0, sizeof s);
     struct timespec t0;
     int timed = timing_enabled();
     if (timed) {

@@ -41,8 +41,12 @@ public final class SkGfxHook
   private static final double[] NO_PHASES = new double[0];
   private static boolean swapIntervalForced;
   private static boolean overlayFailed;
-  private static final java.nio.IntBuffer sizeWidth = org.lwjgl.BufferUtils.createIntBuffer(1);
-  private static final java.nio.IntBuffer sizeHeight = org.lwjgl.BufferUtils.createIntBuffer(1);
+  // Plain direct buffers: the class initializer runs during the agent's start-up, before the game's LWJGL is
+  // necessarily visible, so it must not need LWJGL classes.
+  private static final java.nio.IntBuffer sizeWidth = java.nio.ByteBuffer.allocateDirect(4)
+    .order(java.nio.ByteOrder.nativeOrder()).asIntBuffer();
+  private static final java.nio.IntBuffer sizeHeight = java.nio.ByteBuffer.allocateDirect(4)
+    .order(java.nio.ByteOrder.nativeOrder()).asIntBuffer();
 
   /** The counter over the window the game drew straight into (offscreen pipeline off). */
   private static void drawCounterOnWindow (long window, String text)
@@ -224,11 +228,22 @@ public final class SkGfxHook
   private static final boolean DEBUG_HOLD = Boolean.getBoolean("skgfx.fg.debugHold");
   private static final double[] DEBUG_SHIFT = parseShift(System.getProperty("skgfx.fg.debugShift"));
 
-  private static double[] parseShift (String value)
+  /** A malformed test property is ignored with a warning: it must never stop the game from starting. */
+  static double[] parseShift (String value)
   {
     if (value == null) return null;
     String[] parts = value.split(",");
-    return SkGfxCamera.translation(Double.parseDouble(parts[0]), Double.parseDouble(parts[1]), Double.parseDouble(parts[2]));
+    if (parts.length != 3) {
+      System.err.println("[skgfx] ignoring skgfx.fg.debugShift: expected dx,dy,dz but got \"" + value + "\"");
+      return null;
+    }
+    try {
+      return SkGfxCamera.translation(Double.parseDouble(parts[0].trim()), Double.parseDouble(parts[1].trim()),
+        Double.parseDouble(parts[2].trim()));
+    } catch (NumberFormatException e) {
+      System.err.println("[skgfx] ignoring skgfx.fg.debugShift: \"" + value + "\" is not three numbers");
+      return null;
+    }
   }
 
   private static SkGfxCamera.Estimate debugEstimate (SkGfxCamera.Estimate real)

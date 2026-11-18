@@ -1,6 +1,7 @@
 package com.sirdank.skgfx;
 
 import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.classfile.ClassTransform;
 import java.lang.classfile.CodeBuilder;
 import java.lang.classfile.CodeTransform;
@@ -38,6 +39,7 @@ public final class SkGfxAgent
   private static final String GLFW = "org/lwjgl/glfw/GLFW";
   private static final String GL11 = "org/lwjgl/opengl/GL11";
   private static final String GL12 = "org/lwjgl/opengl/GL12";
+  private static final String GL15 = "org/lwjgl/opengl/GL15";
   private static final String GL30 = "org/lwjgl/opengl/GL30";
   private static final String GL_PREFIX = "org/lwjgl/opengl/GL";
   private static final ClassDesc HOOK = ClassDesc.of("com.sirdank.skgfx.SkGfxHook");
@@ -45,14 +47,19 @@ public final class SkGfxAgent
   private static final ClassDesc OBJECT = ClassDesc.of("java.lang.Object");
 
   public static void premain (String args, Instrumentation inst)
-    throws Exception
   {
-    // The hook classes must be visible to the game's classes, wherever they were loaded from.
-    String self = SkGfxAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI().getPath();
-    inst.appendToSystemClassLoaderSearch(new JarFile(self));
-    inst.addTransformer(new Transformer());
-    System.err.println("[skgfx] agent active: scale=" + SkGfxHook.SCALE + " sharpen=" + SkGfxHook.SHARPEN
-      + (SkGfxTrace.ENABLED ? " TRACE (touch skgfx-trace.trigger in the game folder to capture)" : ""));
+    // Fail open: whatever goes wrong here, the game still starts, just without the enhancements.
+    try {
+      // The hook classes must be visible to the game's classes, wherever they were loaded from.
+      java.io.File self = java.nio.file.Path.of(SkGfxAgent.class.getProtectionDomain().getCodeSource().getLocation().toURI())
+        .toFile();
+      inst.appendToSystemClassLoaderSearch(new JarFile(self));
+      inst.addTransformer(new Transformer());
+      System.err.println("[skgfx] agent active: scale=" + SkGfxHook.SCALE + " sharpen=" + SkGfxHook.SHARPEN
+        + (SkGfxTrace.ENABLED ? " TRACE (touch skgfx-trace.trigger in the game folder to capture)" : ""));
+    } catch (Throwable t) {
+      System.err.println("[skgfx] agent not started, the game runs without it: " + t);
+    }
   }
 
   private static final class Transformer implements ClassFileTransformer
@@ -70,7 +77,7 @@ public final class SkGfxAgent
       // keeps its original bytes, so the agent leaves the rest of the game untouched.
       if (!mentionsInterceptedOwner(bytes)) return null;
       try {
-        return rewrite(bytes);
+        return rewrite(bytes, SkGfxTrace.ENABLED, SkGfxHook.HUD_SPLIT, SkGfxHook.FRAME_GEN, loader);
       } catch (Throwable t) {
         // An unreadable class is left as it was; the game must keep launching no matter what.
         System.err.println("[skgfx] couldn't instrument " + name + ": " + t);
@@ -97,6 +104,16 @@ public final class SkGfxAgent
 
   /** As {@link #rewrite(byte[])}; with {@code trace}, every static GL/GLFW call is also logged before it runs. */
   static byte[] rewrite (byte[] bytes, boolean trace, boolean hudSplit, boolean camera)
+  {
+    return rewrite(bytes, trace, hudSplit, camera, null);
+  }
+
+  /**
+   * As above, with the class loader the class comes from. The new stack maps of a rewritten method may have to
+   * merge two game types, and the class file library can only find their parents through a loader that can read
+   * them: the system loader (its default) does not know classes a launcher loaded itself.
+   */
+  static byte[] rewrite (byte[] bytes, boolean trace, boolean hudSplit, boolean camera, ClassLoader loader)
   {
     boolean[] hit = {false};
     CodeTransform swap = (builder, element) -> {
@@ -133,7 +150,10 @@ public final class SkGfxAgent
         builder.with(element);
       }
     };
-    ClassFile cf = ClassFile.of();
+    ClassHierarchyResolver resolver = loader == null
+      ? ClassHierarchyResolver.defaultResolver()
+      : ClassHierarchyResolver.ofResourceParsing(loader).orElse(ClassHierarchyResolver.defaultResolver());
+    ClassFile cf = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(resolver));
     byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(swap));
     return hit[0] ? out : null;
   }
@@ -253,15 +273,22 @@ public final class SkGfxAgent
   /** Scans raw class bytes for the UTF-8 constants naming the intercepted owners. */
   static boolean mentionsInterceptedOwner (byte[] bytes)
   {
+    return mentionsInterceptedOwner(bytes, SkGfxHook.FRAME_GEN);
+  }
+
+  /** With frame generation the camera hooks also replace {@code GL15.glBindBuffer}, so GL15 counts as an owner. */
+  static boolean mentionsInterceptedOwner (byte[] bytes, boolean camera)
+  {
     if (SkGfxTrace.ENABLED) return contains(bytes, OWNER_GLFW) || contains(bytes, OWNER_GL_PREFIX);
     return contains(bytes, OWNER_GLFW) || contains(bytes, OWNER_GL11) || contains(bytes, OWNER_GL12)
-      || contains(bytes, OWNER_GL30);
+      || contains(bytes, OWNER_GL30) || (camera && contains(bytes, OWNER_GL15));
   }
 
   private static final byte[] OWNER_GLFW = GLFW.getBytes(java.nio.charset.StandardCharsets.UTF_8);
   private static final byte[] OWNER_GL11 = GL11.getBytes(java.nio.charset.StandardCharsets.UTF_8);
   private static final byte[] OWNER_GL12 = GL12.getBytes(java.nio.charset.StandardCharsets.UTF_8);
   private static final byte[] OWNER_GL30 = GL30.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+  private static final byte[] OWNER_GL15 = GL15.getBytes(java.nio.charset.StandardCharsets.UTF_8);
   private static final byte[] OWNER_GL_PREFIX = GL_PREFIX.getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
   private static boolean contains (byte[] haystack, byte[] needle)

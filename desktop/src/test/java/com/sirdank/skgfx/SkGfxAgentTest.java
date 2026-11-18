@@ -132,6 +132,91 @@ public class SkGfxAgentTest
     assertTrue(ClassFile.of().verify(out).isEmpty());
   }
 
+  /** A class that only binds buffers: no GLFW, GL11, GL12 or GL30 in its constant pool. */
+  private static byte[] bufferOnlyClass ()
+  {
+    ClassDesc gl15 = ClassDesc.ofInternalName("org/lwjgl/opengl/GL15");
+    return ClassFile.of().build(ClassDesc.of("fake.Buffers"), cb -> cb
+      .withMethodBody("bind", MethodTypeDesc.ofDescriptor("()V"), ACC_PUBLIC | ACC_STATIC, code -> code
+        .loadConstant(0x8892).iconst_1()
+        .invokestatic(gl15, "glBindBuffer", MethodTypeDesc.ofDescriptor("(II)V"))
+        .return_()));
+  }
+
+  @Test
+  public void aClassThatOnlyBindsBuffersIsConsideredWhenFrameGenerationTracksTheCamera ()
+  {
+    byte[] bytes = bufferOnlyClass();
+    assertFalse(SkGfxAgent.mentionsInterceptedOwner(bytes, false));
+    assertTrue(SkGfxAgent.mentionsInterceptedOwner(bytes, true));
+    List<String> owners = invokedOwners(SkGfxAgent.rewrite(bytes, false, false, true));
+    assertTrue(owners.contains("com/sirdank/skgfx/SkGfxHook.bindBuffer"), owners.toString());
+  }
+
+  /** A class loader that serves {@code name.class} resources from memory and nothing else. */
+  private static final class MemoryLoader extends ClassLoader
+  {
+    private final java.util.Map<String, byte[]> classes = new java.util.HashMap<>();
+
+    MemoryLoader () { super(null); }
+
+    @Override
+    public java.io.InputStream getResourceAsStream (String name)
+    {
+      byte[] bytes = classes.get(name);
+      return bytes == null ? null : new java.io.ByteArrayInputStream(bytes);
+    }
+  }
+
+  @Test
+  public void gameTypesOfACustomLoaderCanBeMergedWhenTheMethodIsRewritten ()
+  {
+    ClassFile plain = ClassFile.of(ClassFile.StackMapsOption.DROP_STACK_MAPS);
+    MemoryLoader loader = new MemoryLoader();
+    for (String name : new String[] {"launcher.A", "launcher.B"}) {
+      loader.classes.put(name.replace('.', '/') + ".class", plain.build(ClassDesc.of(name), cb -> cb
+        .withMethodBody("<init>", MethodTypeDesc.ofDescriptor("()V"), ACC_PUBLIC, code -> code
+          .aload(0)
+          .invokespecial(ClassDesc.of("java.lang.Object"), "<init>", MethodTypeDesc.ofDescriptor("()V"))
+          .return_())));
+    }
+    ClassDesc a = ClassDesc.of("launcher.A");
+    ClassDesc b = ClassDesc.of("launcher.B");
+    ClassDesc object = ClassDesc.of("java.lang.Object");
+    ClassDesc gl11 = ClassDesc.ofInternalName("org/lwjgl/opengl/GL11");
+    byte[] game = plain.build(ClassDesc.of("launcher.Game"), cb -> cb
+      .withMethodBody("run", MethodTypeDesc.ofDescriptor("(Z)V"), ACC_PUBLIC | ACC_STATIC, code -> {
+        var otherwise = code.newLabel();
+        var join = code.newLabel();
+        code.iload(0).ifeq(otherwise)
+          .new_(a).dup().invokespecial(a, "<init>", MethodTypeDesc.ofDescriptor("()V")).astore(1).goto_(join)
+          .labelBinding(otherwise)
+          .new_(b).dup().invokespecial(b, "<init>", MethodTypeDesc.ofDescriptor("()V")).astore(1)
+          .labelBinding(join)
+          .aload(1).invokevirtual(object, "hashCode", MethodTypeDesc.ofDescriptor("()I")).pop()
+          .iconst_0().iconst_0().iconst_1().iconst_1()
+          .invokestatic(gl11, "glViewport", MethodTypeDesc.ofDescriptor("(IIII)V"))
+          .return_();
+      }));
+
+    // The system loader has never heard of launcher.A and launcher.B: without the game's loader this class
+    // cannot be instrumented, which used to be swallowed as "couldn't instrument".
+    assertThrows(RuntimeException.class, () -> SkGfxAgent.rewrite(game, false, true, false, null));
+    byte[] out = SkGfxAgent.rewrite(game, false, true, false, loader);
+    assertNotNull(out);
+    assertTrue(invokedOwners(out).contains("com/sirdank/skgfx/SkGfxHook.viewport"));
+  }
+
+  @Test
+  public void aMalformedDebugShiftIsIgnoredNotFatal ()
+  {
+    assertNull(SkGfxHook.parseShift(null));
+    assertNull(SkGfxHook.parseShift("1,2"));
+    assertNull(SkGfxHook.parseShift("a,b,c"));
+    assertNull(SkGfxHook.parseShift(""));
+    assertNotNull(SkGfxHook.parseShift("1, 2.5, -3"));
+  }
+
   @Test
   public void leavesUnrelatedClassesAlone ()
   {

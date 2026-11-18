@@ -69,20 +69,7 @@ final class SkGfxPacer
     boolean ok = false;
     hookStart = segStart = now;
     if (lastEnd != 0) outsideSum += now - lastEnd;
-    if (lastFrame != 0) {
-      long dt = now - lastFrame;
-      if (dt > HITCH_NANOS || (interval > 0 && dt > 2 * interval)) {
-        skippedHitch++;
-      } else {
-        interval = interval == 0 ? dt : interval * 0.9 + dt * 0.1;
-        ok = true;
-        // Frame generation must never cost the game real frame rate. If the game's frame interval grows past the best it
-        // has managed, our waits are eating into it, so they shrink (outputs bunch up) until the interval is back.
-        bestInterval = bestInterval == 0 ? interval : Math.min(bestInterval * 1.0005, interval);
-        if (interval > bestInterval * 1.04) waitScale = Math.max(0.15, waitScale * 0.92);
-        else waitScale = Math.min(1.0, waitScale * 1.004);
-      }
-    }
+    if (lastFrame != 0) ok = frameTime(now - lastFrame);
     lastFrame = now;
     frames++;
     counterFrames++;
@@ -98,6 +85,48 @@ final class SkGfxPacer
       ok = false;
     }
     return ok;
+  }
+
+  /** Frames in a row that are too long for the current interval, but not hitches, before they become the interval. */
+  static final int REGIME_FRAMES = 5;
+
+  private int regimeFrames;
+
+  /**
+   * Takes one frame time (nanoseconds since the previous frame). @return true when the frame is steady enough to
+   * generate for: it fits the interval learned so far.
+   * <p>
+   * A single long frame is a hitch and is skipped. Several long-but-not-huge frames in a row are not hitches, they are
+   * the game changing speed (a fast menu, then a steady slower zone): without adopting that new rhythm every frame
+   * would look like a hitch against the old, shorter interval and generation would stay off for good.
+   */
+  boolean frameTime (long dt)
+  {
+    boolean tooLong = dt > HITCH_NANOS;
+    if (tooLong || (interval > 0 && dt > 2 * interval)) {
+      skippedHitch++;
+      regimeFrames = tooLong ? 0 : regimeFrames + 1;
+      if (regimeFrames >= REGIME_FRAMES) {
+        interval = dt;
+        bestInterval = dt;
+        regimeFrames = 0;
+      }
+      return false;
+    }
+    regimeFrames = 0;
+    interval = interval == 0 ? dt : interval * 0.9 + dt * 0.1;
+    // Frame generation must never cost the game real frame rate. If the game's frame interval grows past the best it
+    // has managed, our waits are eating into it, so they shrink (outputs bunch up) until the interval is back.
+    bestInterval = bestInterval == 0 ? interval : Math.min(bestInterval * 1.0005, interval);
+    if (interval > bestInterval * 1.04) waitScale = Math.max(0.15, waitScale * 0.92);
+    else waitScale = Math.min(1.0, waitScale * 1.004);
+    return true;
+  }
+
+  /** The learned frame interval in nanoseconds (0 before the first steady frame). */
+  double interval ()
+  {
+    return interval;
   }
 
   /** Closes the current timing segment (index into SEGMENTS) and starts the next. */
@@ -140,7 +169,14 @@ final class SkGfxPacer
    * How much a sleep can overshoot, as last observed: ~3 ms on macOS, up to the timer period (often 15.6 ms) on
    * Windows. The wait sleeps only what it can afford to overshoot and spins the rest, so it ends on time anywhere.
    */
-  private long parkOvershoot = calibrate();
+  private long parkOvershoot = -1;
+
+  /** The measured sleep overshoot, measured on first use (a wait that never happens costs nothing at start-up). */
+  private long overshoot ()
+  {
+    if (parkOvershoot < 0) parkOvershoot = calibrate();
+    return parkOvershoot;
+  }
 
   /** The part of a wait that is spun instead of slept, for an observed sleep overshoot (in nanoseconds). */
   static long spinMargin (long overshoot)
@@ -204,7 +240,7 @@ final class SkGfxPacer
   {
     long left;
     while ((left = target - System.nanoTime()) > 0) {
-      long margin = spinMargin(parkOvershoot);
+      long margin = spinMargin(overshoot());
       if (left > margin + 500_000L) {
         long request = left - margin;
         long start = System.nanoTime();
@@ -278,8 +314,8 @@ final class SkGfxPacer
         + "swap interval ms avg %.2f min %.2f max %.2f sd %.2f, display %d Hz%n",
       frames / seconds, presents / seconds, generated, skippedRate, skippedHitch,
       mean, swaps > 0 ? min : 0, max, sd, refreshRate);
-    System.err.printf("[skgfx] sleep overshoot %.2f ms, spin margin %.2f ms, wait scale %.2f, %s%n", parkOvershoot / 1e6,
-      spinMargin(parkOvershoot) / 1e6, waitScale,
+    System.err.printf("[skgfx] sleep overshoot %.2f ms, spin margin %.2f ms, wait scale %.2f, %s%n", overshoot() / 1e6,
+      spinMargin(overshoot()) / 1e6, waitScale,
       ADAPTIVE ? "adaptive target " + (TARGET > 0 ? TARGET : refreshRate) + " fps" : "fixed " + MULTIPLIER + "x");
     StringBuilder sb = new StringBuilder("[skgfx] per game frame ms: outside hook ")
       .append(String.format("%.2f", outsideSum / frames / 1e6)).append(", in hook ")

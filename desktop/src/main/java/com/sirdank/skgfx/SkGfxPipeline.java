@@ -756,7 +756,7 @@ final class SkGfxPipeline
         vec3 h = fetch(tc + vec2(0.0, uTexel.y));
         vec3 mn = min(min(min(d, e), min(f, b)), h);
         vec3 mx = max(max(max(d, e), max(f, b)), h);
-        vec3 amp = clamp(min(mn, 2.0 - mx) / (mx + 1e-5), 0.0, 1.0);
+        vec3 amp = clamp(min(mn, 1.0 - mx) / (mx + 1e-5), 0.0, 1.0);
         amp = sqrt(amp);
         float peak = -1.0 / mix(8.0, 5.0, uSharp);
         vec3 w = amp * peak;
