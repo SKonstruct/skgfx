@@ -29,7 +29,7 @@ public final class SkGfxTrace
   private static final File TRIGGER = new File("skgfx-trace.trigger");
 
   private static volatile boolean capturing;
-  private static Thread renderThread;
+  private static volatile Thread renderThread;
   private static final List<String> lines = new ArrayList<>();
   private static long frame;
   private static int remaining;
@@ -55,14 +55,32 @@ public final class SkGfxTrace
       }
       return;
     }
-    frame++;
-    if (frame == AUTO_FRAME || (frame % 30 == 0 && TRIGGER.exists())) {
-      TRIGGER.delete();
+    frame++; // frames count from 1: -Dskgfx.trace.frame=0 (like the default, -1) never matches
+    if (frame == AUTO_FRAME || (frame % 30 == 0 && takeTrigger(TRIGGER))) {
       lines.clear();
       lines.add("# capture start at frame " + frame);
       remaining = FRAMES;
       capturing = true;
     }
+  }
+
+  /** Set once a trigger file could not be deleted: it would otherwise start a capture every 30 frames, for ever. */
+  private static boolean triggerStuck;
+
+  /** Whether the trigger file is there; picking it up deletes it, and one that cannot be deleted counts only once. */
+  static boolean takeTrigger (File trigger)
+  {
+    if (triggerStuck || !trigger.exists()) return false;
+    if (!trigger.delete()) {
+      triggerStuck = true;
+      System.err.println("[skgfx] couldn't delete " + trigger + ": it starts one capture only");
+    }
+    return true;
+  }
+
+  static void resetTriggerForTest ()
+  {
+    triggerStuck = false;
   }
 
   private static void write ()
@@ -82,12 +100,12 @@ public final class SkGfxTrace
         previous = line;
       }
       flushRepeat(w, repeat);
+      System.err.println("[skgfx] trace written: " + out.getAbsolutePath() + " (" + lines.size() + " calls)");
     } catch (IOException e) {
       System.err.println("[skgfx] couldn't write trace: " + e);
-      return;
+    } finally {
+      lines.clear(); // a failed write must not keep up to 400,000 lines alive
     }
-    System.err.println("[skgfx] trace written: " + out.getAbsolutePath() + " (" + lines.size() + " calls)");
-    lines.clear();
   }
 
   private static void flushRepeat (PrintWriter w, int repeat)
@@ -95,7 +113,7 @@ public final class SkGfxTrace
     if (repeat > 0) w.println("    x" + (repeat + 1) + " total");
   }
 
-  private static String format (String name, Object[] args)
+  static String format (String name, Object[] args)
   {
     StringBuilder sb = new StringBuilder(name).append('(');
     for (int i = 0; i < args.length; i++) {
@@ -109,6 +127,11 @@ public final class SkGfxTrace
           sb.append(String.format("%.4g", fb.get(fb.position() + j)));
         }
         sb.append(']');
+      } else if (a != null && a.getClass().isArray() && a.getClass().getComponentType().isPrimitive()) {
+        int length = java.lang.reflect.Array.getLength(a);
+        sb.append(a.getClass().getComponentType().getSimpleName()).append("[").append(length).append("]{");
+        for (int j = 0; j < Math.min(16, length); j++) sb.append(j > 0 ? " " : "").append(java.lang.reflect.Array.get(a, j));
+        sb.append(length > 16 ? " ...}" : "}");
       } else if (a instanceof Buffer b) {
         sb.append(b.getClass().getSimpleName()).append('#').append(b.remaining());
       } else if (a instanceof CharSequence s) {

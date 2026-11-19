@@ -1,8 +1,5 @@
 package com.sirdank.skgfx;
 
-import java.util.ArrayList;
-import java.util.List;
-
 /**
  * Which frames to show for each real frame, for any multiplier. Time is measured in real-frame intervals: the previous
  * real frame is at 0 and the one that just arrived at 1. Outputs sit on an even grid {@code 1/m} apart; each output
@@ -27,18 +24,22 @@ final class SkGfxSchedule
    */
   double[] outputs (double m)
   {
+    // Not a multiplier (NaN, below 1, infinite: a step of 0 would never reach the end of the interval): no frames.
+    if (!Double.isFinite(m) || m < 1.0) {
+      reset();
+      return new double[0];
+    }
     double step = 1.0 / m;
     if (next <= 0) next = step;
-    if (next > step) next = step; // the multiplier dropped: do not wait out the old, longer spacing
-    List<Double> phases = new ArrayList<>();
-    while (next <= 1.0 + 1e-9) {
-      phases.add(1.0 - next < 1e-6 ? 1.0 : next);
+    if (next > step) next = step; // the spacing dropped (the multiplier rose): do not wait out the old, longer one
+    double[] phases = new double[(int) Math.ceil(m) + 1];
+    int count = 0;
+    while (next <= 1.0 + 1e-9 && count < phases.length) {
+      phases[count++] = 1.0 - next < 1e-6 ? 1.0 : next;
       next += step;
     }
     next -= 1.0;
     if (next <= 1e-9) next = step;
-    double[] out = new double[phases.size()];
-    for (int i = 0; i < out.length; i++) out[i] = phases.get(i);
-    return out;
+    return java.util.Arrays.copyOf(phases, count);
   }
 }

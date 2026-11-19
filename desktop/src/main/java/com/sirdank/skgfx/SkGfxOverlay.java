@@ -33,15 +33,21 @@ final class SkGfxOverlay
     {" ", "00000", "00000", "00000", "00000", "00000", "00000", "00000"},
   };
 
+  /** The rows of each glyph by character, built once: the counter is drawn on every present. */
+  private static final java.util.Map<Character, String[]> GLYPHS = new java.util.HashMap<>();
+  private static final String[] BLANK;
+
+  static {
+    for (String[] entry : FONT) GLYPHS.put(entry[0].charAt(0), java.util.Arrays.copyOfRange(entry, 1, 1 + GLYPH_HEIGHT));
+    BLANK = GLYPHS.get(' ');
+  }
+
   private SkGfxOverlay () { }
 
-  /** The rows of a character's glyph (seven 5-character strings), or blanks for one the font does not have. */
+  /** The rows of a character's glyph (seven 5-character strings, shared: do not modify), or blanks for one the font does not have. */
   static String[] glyph (char c)
   {
-    for (String[] entry : FONT) {
-      if (entry[0].charAt(0) == c) return java.util.Arrays.copyOfRange(entry, 1, 1 + GLYPH_HEIGHT);
-    }
-    return glyph(' ');
+    return GLYPHS.getOrDefault(c, BLANK);
   }
 
   /** Width of the text in font pixels (a one pixel gap between characters). */
@@ -87,6 +93,10 @@ final class SkGfxOverlay
       for (int unit = 2; unit >= 0; unit--) {
         glActiveTexture(GL_TEXTURE0 + unit);
         glDisable(GL_TEXTURE_2D);
+        // In the fixed-function pipeline the higher-dimension targets win over 2D when enabled.
+        glDisable(GL_TEXTURE_1D);
+        glDisable(org.lwjgl.opengl.GL12.GL_TEXTURE_3D);
+        glDisable(org.lwjgl.opengl.GL13.GL_TEXTURE_CUBE_MAP);
       }
       glDisable(GL_DEPTH_TEST);
       glDisable(GL_STENCIL_TEST);
@@ -97,6 +107,7 @@ final class SkGfxOverlay
       glDisable(GL_ALPHA_TEST);
       glEnable(GL_BLEND);
       glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      org.lwjgl.opengl.GL14.glBlendEquation(org.lwjgl.opengl.GL14.GL_FUNC_ADD);
       glColorMask(true, true, true, true);
 
       glBegin(GL_QUADS);

@@ -1,7 +1,7 @@
 // SKapsule's graphics present pass: render the game offscreen, sharpen it (CAS) on the way to the
 // window, and optionally keep the HUD in its own full-resolution layer ("Sharp HUD").
 //
-// Shared by SKapsule (Android) and SKapsule-iOS: the two copies are kept in step. Everything runs on
+// The single source for SKapsule (Android) and SKapsule-iOS. Everything runs on
 // the game's render thread with its GL context current, except skgfx_set_config(). It talks to gl4es
 // through the hook table in gl4es' framebuffers.h, and fails open: any trouble leaves the game
 // drawing straight into the window as before.

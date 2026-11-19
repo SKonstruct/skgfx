@@ -52,12 +52,22 @@ public class SkGfxScheduleTest
   }
 
   @Test
-  public void aMultiplierThatDropsTakesEffectAtOnce ()
+  public void aSpacingThatDropsTakesEffectAtOnce ()
   {
     SkGfxSchedule schedule = new SkGfxSchedule();
     schedule.outputs(1.1);
     double[] after = schedule.outputs(3.0);
     assertEquals(1.0, after[after.length - 1], 1e-9);
     assertTrue(after.length >= 2 && after.length <= 3);
+  }
+
+  @Test
+  public void somethingThatIsNotAMultiplierGivesNoFramesInsteadOfLoopingForever ()
+  {
+    SkGfxSchedule schedule = new SkGfxSchedule();
+    for (double m : new double[] {Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 0, -2, 0.5}) {
+      assertEquals(0, schedule.outputs(m).length, "m=" + m);
+    }
+    assertArrayEquals(new double[] {0.5, 1.0}, schedule.outputs(2.0), 1e-9);
   }
 }

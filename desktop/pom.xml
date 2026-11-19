@@ -21,8 +21,8 @@
   </licenses>
 
   <properties>
-    <!-- The agent rewrites classes with java.lang.classfile, which is final in Java 24. -->
-    <maven.compiler.release>25</maven.compiler.release>
+    <!-- The agent rewrites classes with java.lang.classfile, which is final in Java 24: the jar runs on 24 and newer. -->
+    <maven.compiler.release>24</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.build.outputTimestamp>2026-01-01T00:00:00Z</project.build.outputTimestamp>
     <lwjgl.version>3.4.3</lwjgl.version>

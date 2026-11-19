@@ -18,8 +18,8 @@ classes by name: it rewrites call sites of a few stable LWJGL methods (`glfwSwap
 `glViewport`, `glScissor`, ...) so the game renders into an offscreen target that is scaled, optionally sharpened and
 then presented. It keeps working across game updates and falls back to the plain calls if anything fails.
 
-**Requires Java 24 or newer** (it rewrites classes with `java.lang.classfile`, final in Java 24; the project is built
-for Java 25). LWJGL is a compile-time (`provided`) dependency only: the agent uses the LWJGL 3 already on the game's
+**Requires Java 24 or newer** (it rewrites classes with `java.lang.classfile`, final in Java 24; the jar is built for
+Java 24). LWJGL is a compile-time (`provided`) dependency only: the agent uses the LWJGL 3 already on the game's
 class path (built against 3.4.3).
 
 ### Build
@@ -29,7 +29,7 @@ cd desktop
 ./mvnw -B verify
 ```
 
-This uses the bundled Apache Maven Wrapper (`mvnw.cmd` on Windows) and needs only a JDK 25 on `JAVA_HOME` or `PATH`.
+This uses the bundled Apache Maven Wrapper (`mvnw.cmd` on Windows) and needs only a JDK 24 or newer on `JAVA_HOME` or `PATH` (CI builds with 25).
 The jar is written to `desktop/target/skgfx-agent.jar`.
 
 ### Use
@@ -61,7 +61,7 @@ With no properties set the agent does nothing visible except the FPS counter.
 | `skgfx.fg.debugHold` | `true`/`false` | Test aid: show a generated frame in place of the real one. |
 | `skgfx.fg.debugShift` | `dx,dy,dz` | Test aid: replace the camera delta with a fixed eye-space translation. |
 | `skgfx.trace` | `true`/`false` | Developer tool: record every GL/GLFW call of one or two frames to `skgfx-trace-<n>.txt`. |
-| `skgfx.trace.frame` | frame number | Start the capture at this frame (otherwise create `skgfx-trace.trigger` in the working directory). |
+| `skgfx.trace.frame` | frame number (counting from 1) | Start the capture at this frame (otherwise create `skgfx-trace.trigger` in the working directory). |
 | `skgfx.trace.frames` | count, default 2 | Number of frames a capture covers. |
 
 ## License

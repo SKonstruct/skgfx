@@ -1,0 +1,4 @@
+.DS_Store
+# developer trace output of -Dskgfx.trace
+skgfx-trace-*.txt
+skgfx-trace.trigger

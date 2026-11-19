@@ -27,9 +27,16 @@ final class SkGfxPacer
 
   private static double doubleProperty (String key, double fallback)
   {
+    return finiteOr(System.getProperty(key), fallback);
+  }
+
+  /** The number in a property value, or {@code fallback} when it is missing, not a number, NaN or infinite. */
+  static double finiteOr (String value, double fallback)
+  {
+    if (value == null) return fallback;
     try {
-      String value = System.getProperty(key);
-      return value == null ? fallback : Double.parseDouble(value);
+      double parsed = Double.parseDouble(value.trim());
+      return Double.isFinite(parsed) ? parsed : fallback; // "NaN" parses, and would slip past every clamp
     } catch (NumberFormatException e) {
       return fallback;
     }
@@ -123,6 +130,12 @@ final class SkGfxPacer
     return true;
   }
 
+  /** The game made a new window (maybe on another display): look the refresh rate up again at the next frame. */
+  void windowChanged ()
+  {
+    framesSinceRefresh = 1_000_000;
+  }
+
   /** The learned frame interval in nanoseconds (0 before the first steady frame). */
   double interval ()
   {
@@ -160,7 +173,7 @@ final class SkGfxPacer
     }
     lastSwap = now;
     if (reportStart != 0 && now - reportStart >= REPORT_NANOS) {
-      if (SkGfxHook.STATS_LOG) report(now);
+      if (SkGfxHook.STATS) report(now);
       else clearReport(now);
     }
   }
@@ -327,22 +340,58 @@ final class SkGfxPacer
     if (gpuCount[0] + gpuCount[1] > 0) {
       System.err.printf("[skgfx] gpu ms (own passes, with glFinish): generated frame %.2f, real frame %.2f%n",
         gpuCount[0] > 0 ? gpuSum[0] / gpuCount[0] : 0, gpuCount[1] > 0 ? gpuSum[1] / gpuCount[1] : 0);
-      java.util.Arrays.fill(gpuSum, 0);
-      java.util.Arrays.fill(gpuCount, 0);
     }
-    java.util.Arrays.fill(segSum, 0);
-    hookSum = outsideSum = 0;
-    reportStart = now;
-    frames = generated = skippedRate = skippedHitch = swaps = presents = 0;
-    sum = sumSq = max = 0;
-    min = Double.MAX_VALUE;
+    clearReport(now);
+  }
+
+  /**
+   * The monitor the window is on: its fullscreen monitor, else (windowed or borderless, where GLFW reports none) the one
+   * it overlaps most, else the primary one. A game window on a second display runs at that display's refresh rate.
+   */
+  private static long monitorOf (long window)
+  {
+    long monitor = GLFW.glfwGetWindowMonitor(window);
+    if (monitor != 0) return monitor;
+    org.lwjgl.PointerBuffer monitors = GLFW.glfwGetMonitors();
+    if (monitors != null && monitors.remaining() > 1) {
+      int[] x = {0}, y = {0}, w = {0}, h = {0};
+      GLFW.glfwGetWindowPos(window, x, y);
+      GLFW.glfwGetWindowSize(window, w, h);
+      int[][] rects = new int[monitors.remaining()][];
+      for (int i = 0; i < rects.length; i++) {
+        long other = monitors.get(monitors.position() + i);
+        int[] mx = {0}, my = {0};
+        GLFW.glfwGetMonitorPos(other, mx, my);
+        GLFWVidMode mode = GLFW.glfwGetVideoMode(other);
+        rects[i] = new int[] {mx[0], my[0], mode == null ? 0 : mode.width(), mode == null ? 0 : mode.height()};
+      }
+      int best = bestMonitor(x[0], y[0], w[0], h[0], rects);
+      if (best >= 0) return monitors.get(monitors.position() + best);
+    }
+    return GLFW.glfwGetPrimaryMonitor();
+  }
+
+  /** Index of the monitor rectangle ({@code x, y, width, height}) the window rectangle overlaps most; -1 for none. */
+  static int bestMonitor (int wx, int wy, int ww, int wh, int[][] monitors)
+  {
+    int best = -1;
+    long bestArea = 0;
+    for (int i = 0; i < monitors.length; i++) {
+      long overlapX = Math.min((long) wx + ww, (long) monitors[i][0] + monitors[i][2]) - Math.max(wx, monitors[i][0]);
+      long overlapY = Math.min((long) wy + wh, (long) monitors[i][1] + monitors[i][3]) - Math.max(wy, monitors[i][1]);
+      if (overlapX <= 0 || overlapY <= 0) continue;
+      if (overlapX * overlapY > bestArea) {
+        bestArea = overlapX * overlapY;
+        best = i;
+      }
+    }
+    return best;
   }
 
   private static int refreshRate (long window)
   {
     try {
-      long monitor = GLFW.glfwGetWindowMonitor(window);
-      if (monitor == 0) monitor = GLFW.glfwGetPrimaryMonitor();
+      long monitor = monitorOf(window);
       GLFWVidMode mode = monitor == 0 ? null : GLFW.glfwGetVideoMode(monitor);
       return mode == null ? 0 : mode.refreshRate();
     } catch (Throwable t) {

@@ -21,10 +21,10 @@ import static org.lwjgl.opengl.GL30.*;
  * bilinear scale plus optional contrast-adaptive sharpening (CAS). Written for the game's own context: GL 2.1
  * compatibility (GLSL 1.20, ARB-style framebuffer objects through the GL30 entry points the game itself uses).
  * <p>
- * Order per frame: the game draws into {@link #framebuffer()} (via the bind redirect), {@link #present(long)}
- * composites it onto the window just before the real swap, and {@link #afterSwap(long)} rebinds the offscreen target
- * so the next frame lands there too. Known limits, documented rather than handled: the game's own MSAA setting does
- * the HUD is scaled with the scene (the game's UI-scale option compensates).
+ * Order per frame: the game draws into {@link #framebuffer()} (via the bind redirect), {@link #prepare(long)} and
+ * {@link #draw(float)} composite it onto the window just before the real swap, and {@link #afterSwap()} rebinds the
+ * offscreen target so the next frame lands there too. Without the HUD split the HUD is scaled with the scene (the game's
+ * UI-scale option compensates).
  * <p>
  * Antialiasing: the game's MSAA is a window setting, so it would be lost on the offscreen target. The target is created
  * with the window's own sample count instead; the game draws into a multisampled framebuffer that is resolved into the
@@ -40,6 +40,7 @@ final class SkGfxPipeline
   /** Scene depth as a texture (frame generation only), for camera reprojection; 0 when unavailable. */
   private int depthTexture;
   private int reprojProgram;
+  private int reprojToCur, reprojToPrev, reprojFrustum, reprojPhase, reprojNearFar;
   private final FloatBuffer matrixA = BufferUtils.createFloatBuffer(16), matrixB = BufferUtils.createFloatBuffer(16);
   /** Multisampled draw target; all zero when the window has no MSAA. */
   private int samples, msaaFramebuffer, msaaColor, msaaDepth;
@@ -52,7 +53,10 @@ final class SkGfxPipeline
   private static Boolean blitAvailable;
   /** HUD target: a transparent real-resolution layer the game's 2D/HUD pass is redirected into (see beginUi). */
   private int uiFramebuffer, uiTexture, uiDepth, uiProgram;
-  private boolean uiActive, inUi;
+  /** The game is drawing into the HUD layer (set by {@link #beginUi}, cleared when the frame is over). */
+  private boolean inUi;
+  /** The scene was already resolved when the HUD began: nothing draws into it after that, so presenting need not resolve again. */
+  private boolean sceneResolvedForUi;
   /** Multisampled HUD target (when the game has MSAA), resolved into uiTexture before presenting. */
   private int uiSamples, uiMsaaFramebuffer, uiMsaaColor, uiMsaaDepth;
   /** Full-window intermediate for the sharpened generated frame. */
@@ -83,6 +87,12 @@ final class SkGfxPipeline
     return samples > 0 ? msaaFramebuffer : framebuffer;
   }
 
+  /** The single-sample framebuffer a game read-back should read: the resolved scene, or the HUD layer during the HUD. */
+  int readFramebuffer ()
+  {
+    return inUi ? uiFramebuffer : framebuffer;
+  }
+
   /** Whether the game is currently drawing into the HUD layer. */
   boolean inUi ()
   {
@@ -104,8 +114,8 @@ final class SkGfxPipeline
   {
     if (framebuffer == 0 || realWidth == 0) return;
     resolve();
+    sceneResolvedForUi = true;
     ensureUi();
-    uiActive = true;
     inUi = true;
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer());
     glPushAttrib(GL_COLOR_BUFFER_BIT | GL_SCISSOR_BIT | GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -128,8 +138,8 @@ final class SkGfxPipeline
   /** The frame is over: the game goes back to drawing into the scene target next frame. */
   void endUi ()
   {
-    uiActive = false;
     inUi = false;
+    sceneResolvedForUi = false;
   }
 
   private void ensureUi ()
@@ -157,13 +167,11 @@ final class SkGfxPipeline
     }
     createUiMultisample();
     if (uiProgram == 0) {
-      int vertex = compile(GL_VERTEX_SHADER, VERTEX_SOURCE);
-      int fragment = compile(GL_FRAGMENT_SHADER, """
+      uiProgram = program(VERTEX_SOURCE, """
         #version 120
         uniform sampler2D uTex;
         void main() { gl_FragColor = texture2D(uTex, gl_TexCoord[0].st); }
         """);
-      uiProgram = link(vertex, fragment);
       int savedProgram = glGetInteger(GL_CURRENT_PROGRAM);
       glUseProgram(uiProgram);
       glUniform1i(glGetUniformLocation(uiProgram, "uTex"), 0);
@@ -174,9 +182,9 @@ final class SkGfxPipeline
   /** Resolves the multisampled HUD layer into its texture; leaves the game drawing into the multisampled one. */
   void resolveUi ()
   {
-    if (!uiActive || uiSamples == 0) return;
+    if (!inUi || uiSamples == 0) return;
     blit(uiMsaaFramebuffer, uiFramebuffer, false, realWidth, realHeight);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, inUi ? uiMsaaFramebuffer : uiFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, uiMsaaFramebuffer);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, uiFramebuffer);
   }
 
@@ -243,8 +251,8 @@ final class SkGfxPipeline
     if (uiFramebuffer != 0) { glDeleteFramebuffers(uiFramebuffer); uiFramebuffer = 0; }
     if (uiTexture != 0) { glDeleteTextures(uiTexture); uiTexture = 0; }
     if (uiDepth != 0) { glDeleteRenderbuffers(uiDepth); uiDepth = 0; }
-    uiActive = false;
     inUi = false;
+    sceneResolvedForUi = false;
   }
 
   private void drawFullScreenQuad ()
@@ -317,16 +325,25 @@ final class SkGfxPipeline
     if (scissor) glEnable(GL_SCISSOR_TEST);
   }
 
+  /** A framebuffer of no size: the window is minimized. */
+  static boolean isMinimized (int width, int height)
+  {
+    return width <= 0 || height <= 0;
+  }
+
   /**
    * Readies the frame the game just drew for presenting (target created or resized, MSAA resolved). @return false when
    * there is nothing of ours to show this frame and the window should be left as the game drew it.
    */
   boolean prepare (long window)
   {
+    GLFW.glfwGetFramebufferSize(window, widthBuf, heightBuf);
+    // Minimized (0 x 0): keep the targets for when the window comes back instead of rebuilding them 1 x 1 and again.
+    if (isMinimized(widthBuf.get(0), heightBuf.get(0))) return false;
     boolean fresh = ensure(window);
     if (fresh) historyValid = false;
     if (fresh || !hasFrame) return false;
-    resolve();
+    if (!sceneResolvedForUi) resolve();
     resolveUi();
     return true;
   }
@@ -340,15 +357,18 @@ final class SkGfxPipeline
   private void useReprojection (double[] toCur, double[] toPrev, double[] frustum, float phase)
   {
     if (reprojProgram == 0) {
-      int vertex = compile(GL_VERTEX_SHADER, VERTEX_SOURCE);
-      int fragment = compile(GL_FRAGMENT_SHADER, REPROJECT_SOURCE);
-      reprojProgram = link(vertex, fragment);
+      reprojProgram = program(VERTEX_SOURCE, REPROJECT_SOURCE);
       int saved = glGetInteger(GL_CURRENT_PROGRAM);
       glUseProgram(reprojProgram);
       glUniform1i(glGetUniformLocation(reprojProgram, "uCur"), 0);
       glUniform1i(glGetUniformLocation(reprojProgram, "uPrev"), 1);
       glUniform1i(glGetUniformLocation(reprojProgram, "uDepth"), 2);
       glUseProgram(saved);
+      reprojToCur = glGetUniformLocation(reprojProgram, "uToCur");
+      reprojToPrev = glGetUniformLocation(reprojProgram, "uToPrev");
+      reprojFrustum = glGetUniformLocation(reprojProgram, "uFrustum");
+      reprojPhase = glGetUniformLocation(reprojProgram, "uPhase");
+      reprojNearFar = glGetUniformLocation(reprojProgram, "uNearFar");
     }
     glUseProgram(reprojProgram);
     matrixA.clear();
@@ -359,12 +379,11 @@ final class SkGfxPipeline
     }
     matrixA.flip();
     matrixB.flip();
-    glUniformMatrix4fv(glGetUniformLocation(reprojProgram, "uToCur"), false, matrixA);
-    glUniformMatrix4fv(glGetUniformLocation(reprojProgram, "uToPrev"), false, matrixB);
-    glUniform4f(glGetUniformLocation(reprojProgram, "uFrustum"), (float) frustum[0], (float) frustum[1],
-      (float) frustum[2], (float) frustum[3]);
-    glUniform1f(glGetUniformLocation(reprojProgram, "uPhase"), phase);
-    glUniform2f(glGetUniformLocation(reprojProgram, "uNearFar"), (float) frustum[4], (float) frustum[5]);
+    glUniformMatrix4fv(reprojToCur, false, matrixA);
+    glUniformMatrix4fv(reprojToPrev, false, matrixB);
+    glUniform4f(reprojFrustum, (float) frustum[0], (float) frustum[1], (float) frustum[2], (float) frustum[3]);
+    glUniform1f(reprojPhase, phase);
+    glUniform2f(reprojNearFar, (float) frustum[4], (float) frustum[5]);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, depthTexture);
     glActiveTexture(GL_TEXTURE1);
@@ -391,7 +410,10 @@ final class SkGfxPipeline
       float y = (ndc.y * (uFrustum.w - uFrustum.z) * 0.5 + (uFrustum.w + uFrustum.z) * 0.5) / n * -ze;
       return vec3(x, y, ze);
     }
+    // A point at or behind the camera has no position on screen: dividing by -p.z would flip its sign and fold it
+    // back inside the picture, so it is sent far outside instead.
     vec2 project(vec3 p) {
+      if (p.z > -1e-4) return vec2(-1.0e4);
       float n = uNearFar.x;
       float xn = (2.0 * n / (uFrustum.y - uFrustum.x) * p.x + (uFrustum.y + uFrustum.x) / (uFrustum.y - uFrustum.x) * p.z) / -p.z;
       float yn = (2.0 * n / (uFrustum.w - uFrustum.z) * p.y + (uFrustum.w + uFrustum.z) / (uFrustum.w - uFrustum.z) * p.z) / -p.z;
@@ -461,6 +483,9 @@ final class SkGfxPipeline
       }
     }
     blit(framebuffer, historyFramebuffer, false);
+    // The blit left the history target bound for drawing; the swap that follows (and whatever hooks it, like an
+    // overlay) must find the window bound.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     historyValid = true;
   }
 
@@ -497,6 +522,7 @@ final class SkGfxPipeline
       glDisable(GL_SCISSOR_TEST);
       glDisable(GL_BLEND);
       glDisable(GL_ALPHA_TEST);
+      glDisable(GL_CULL_FACE); // a face left culled by the game would cull the full-screen quad
       glColorMask(true, true, true, true);
       glViewport(0, 0, realWidth, realHeight);
 
@@ -521,7 +547,7 @@ final class SkGfxPipeline
         }
       } else {
         glUseProgram(program);
-        glUniform2f(texelUniform, 1f / SkGfxHook.scaled(realWidth), 1f / SkGfxHook.scaled(realHeight));
+        glUniform2f(texelUniform, 1f / scaledWidth, 1f / scaledHeight);
         glUniform1f(sharpenUniform, SkGfxHook.SHARPEN);
         glUniform1f(blendUniform, blend);
         if (blend < 1f) {
@@ -533,7 +559,7 @@ final class SkGfxPipeline
         drawFullScreenQuad();
       }
 
-      if (uiActive) {
+      if (inUi) {
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         glUseProgram(uiProgram);
@@ -546,7 +572,7 @@ final class SkGfxPipeline
           SkGfxOverlay.draw(overlayText, realWidth, realHeight, overlayGenerating);
         } catch (Throwable t) {
           overlayText = null;
-          System.err.println("[skgfx] counter disabled after error: " + t);
+          SkGfxHook.overlayFailed(t); // so the hook does not hand the same text back next frame
         }
       }
 
@@ -563,7 +589,7 @@ final class SkGfxPipeline
   }
 
   /** The swap left the window bound; point the game back at the offscreen target for its next frame. */
-  void afterSwap (long window)
+  void afterSwap ()
   {
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer());
     hasFrame = true;
@@ -602,8 +628,8 @@ final class SkGfxPipeline
     framebuffer = glGenFramebuffers();
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
-    if (SkGfxHook.FRAME_GEN && attachDepthTexture(savedTexture)) {
-      // The scene's depth is a texture: the reprojection pass reads it.
+    if (SkGfxHook.FRAME_GEN) {
+      attachDepthTexture(savedTexture); // the scene's depth is a texture: the reprojection pass reads it
     } else if (!multisampled) {
       // Without MSAA the game draws here directly and needs depth/stencil; with it, only the resolve target is kept.
       depthStencil = glGenRenderbuffers();
@@ -619,6 +645,7 @@ final class SkGfxPipeline
       glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
       glDeleteTextures(depthTexture);
       depthTexture = 0;
+      while (glGetError() != GL_NO_ERROR) { } // the attempt may have left errors behind: not the game's
       if (!multisampled) {
         depthStencil = glGenRenderbuffers();
         glBindRenderbuffer(GL_RENDERBUFFER, depthStencil);
@@ -652,7 +679,7 @@ final class SkGfxPipeline
   }
 
   /** Creates the scene depth texture and attaches it to the (bound) scene framebuffer. */
-  private boolean attachDepthTexture (int savedTexture)
+  private void attachDepthTexture (int savedTexture)
   {
     depthTexture = glGenTextures();
     glBindTexture(GL_TEXTURE_2D, depthTexture);
@@ -664,7 +691,6 @@ final class SkGfxPipeline
       GL_UNSIGNED_INT_24_8, (java.nio.ByteBuffer) null);
     glBindTexture(GL_TEXTURE_2D, savedTexture);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depthTexture, 0);
-    return true;
   }
 
   /**
@@ -725,13 +751,27 @@ final class SkGfxPipeline
     hasFrame = false;
   }
 
+  /** The pipeline is over for good (after a failure): everything, programs included, goes back to GL. */
+  void release ()
+  {
+    dispose();
+    if (program != 0) { glDeleteProgram(program); program = 0; }
+    if (uiProgram != 0) { glDeleteProgram(uiProgram); uiProgram = 0; }
+    if (reprojProgram != 0) { glDeleteProgram(reprojProgram); reprojProgram = 0; }
+  }
+
+  /** What the GL context in use right now has to say about blit support is asked again in a new context. */
+  static void forgetContext ()
+  {
+    blitAvailable = null;
+  }
+
   private static int buildProgram ()
   {
-    int vertex = compile(GL_VERTEX_SHADER, VERTEX_SOURCE);
     // The sharpening below follows the algorithm of AMD FidelityFX CAS (MIT license, Copyright (c) 2020 Advanced
     // Micro Devices, Inc.); the notice is reproduced in THIRD-PARTY-NOTICES.md at the repository root.
     // uSharp 0 is a plain bilinear fetch.
-    int fragment = compile(GL_FRAGMENT_SHADER, """
+    return program(VERTEX_SOURCE, """
       #version 120
       uniform sampler2D uTex;
       uniform sampler2D uPrev;
@@ -756,14 +796,13 @@ final class SkGfxPipeline
         vec3 h = fetch(tc + vec2(0.0, uTexel.y));
         vec3 mn = min(min(min(d, e), min(f, b)), h);
         vec3 mx = max(max(max(d, e), max(f, b)), h);
-        vec3 amp = clamp(min(mn, 1.0 - mx) / (mx + 1e-5), 0.0, 1.0);
+        vec3 amp = clamp(min(mn, 1.0 - mx) / (mx + 1e-4), 0.0, 1.0);
         amp = sqrt(amp);
         float peak = -1.0 / mix(8.0, 5.0, uSharp);
         vec3 w = amp * peak;
-        gl_FragColor = vec4(((b + d + f + h) * w + e) / (4.0 * w + 1.0), 1.0);
+        gl_FragColor = vec4(clamp(((b + d + f + h) * w + e) / (4.0 * w + 1.0), 0.0, 1.0), 1.0);
       }
       """);
-    return link(vertex, fragment);
   }
 
   private static final String VERTEX_SOURCE = """
@@ -774,6 +813,20 @@ final class SkGfxPipeline
     }
     """;
 
+  /** Compiles and links a program from a vertex and a fragment source; nothing is left behind when either fails. */
+  private static int program (String vertexSource, String fragmentSource)
+  {
+    int vertex = compile(GL_VERTEX_SHADER, vertexSource);
+    int fragment;
+    try {
+      fragment = compile(GL_FRAGMENT_SHADER, fragmentSource);
+    } catch (RuntimeException e) {
+      glDeleteShader(vertex);
+      throw e;
+    }
+    return link(vertex, fragment);
+  }
+
   private static int link (int vertex, int fragment)
   {
     int program = glCreateProgram();
@@ -783,7 +836,9 @@ final class SkGfxPipeline
     glDeleteShader(vertex);
     glDeleteShader(fragment);
     if (glGetProgrami(program, GL_LINK_STATUS) != GL_TRUE) {
-      throw new IllegalStateException("shader link failed: " + glGetProgramInfoLog(program));
+      String log = glGetProgramInfoLog(program);
+      glDeleteProgram(program);
+      throw new IllegalStateException("shader link failed: " + log);
     }
     return program;
   }
@@ -794,7 +849,9 @@ final class SkGfxPipeline
     glShaderSource(shader, source);
     glCompileShader(shader);
     if (glGetShaderi(shader, GL_COMPILE_STATUS) != GL_TRUE) {
-      throw new IllegalStateException("shader compile failed: " + glGetShaderInfoLog(shader));
+      String log = glGetShaderInfoLog(shader);
+      glDeleteShader(shader);
+      throw new IllegalStateException("shader compile failed: " + log);
     }
     return shader;
   }

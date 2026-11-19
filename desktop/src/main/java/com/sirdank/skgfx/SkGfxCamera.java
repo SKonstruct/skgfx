@@ -114,7 +114,7 @@ final class SkGfxCamera
 
   void push ()
   {
-    if (mode == MODELVIEW) modelviewStack.push(modelview.clone());
+    if (mode == MODELVIEW) modelviewStack.push(modelview); // never mutated in place: every change builds a new array
   }
 
   void pop ()
@@ -124,7 +124,14 @@ final class SkGfxCamera
 
   void perspective (double l, double r, double b, double t, double n, double f)
   {
-    if (mode == PROJECTION) frustum = new double[] {l, r, b, t, n, f};
+    // glFrustum rejects these (GL_INVALID_VALUE) and keeps the old matrix; a stored one would divide by zero later.
+    if (mode == PROJECTION && validFrustum(l, r, b, t, n, f)) frustum = new double[] {l, r, b, t, n, f};
+  }
+
+  static boolean validFrustum (double l, double r, double b, double t, double n, double f)
+  {
+    return Double.isFinite(l) && Double.isFinite(r) && Double.isFinite(b) && Double.isFinite(t) && Double.isFinite(n)
+      && Double.isFinite(f) && l != r && b != t && n > 0 && f > n;
   }
 
   void orthographic ()
@@ -153,11 +160,22 @@ final class SkGfxCamera
     if (worldDone) return;
     if (frameFrustum == null && frustum != null) frameFrustum = frustum;
     long key = 17;
-    for (long v : new long[] {arrayBuffer, elementBuffer, texture, primitive, start, end, count, type, offset}) {
-      key = key * 0x9E3779B97F4A7C15L + v + 0x7F4A7C15L;
-      key ^= key >>> 29;
-    }
+    key = mix(key, arrayBuffer);
+    key = mix(key, elementBuffer);
+    key = mix(key, texture);
+    key = mix(key, primitive);
+    key = mix(key, start);
+    key = mix(key, end);
+    key = mix(key, count);
+    key = mix(key, type);
+    key = mix(key, offset);
     if (current.put(key, modelview) != null) currentDuplicates.add(key);
+  }
+
+  private static long mix (long key, long v)
+  {
+    key = key * 0x9E3779B97F4A7C15L + v + 0x7F4A7C15L;
+    return key ^ (key >>> 29);
   }
 
   /** The 3D world is drawn; later (HUD) draws are not part of the camera estimate. */
@@ -188,7 +206,10 @@ final class SkGfxCamera
       double[] before = a.get(key);
       if (before == null || aDuplicates.contains(key) || bDuplicates.contains(key)) continue;
       double[] inverse = affineInverse(before);
-      if (inverse != null) deltas.add(multiply(e.getValue(), inverse));
+      if (inverse == null) continue;
+      double[] delta = multiply(e.getValue(), inverse);
+      if (finite(delta)) deltas.add(delta); // a NaN matrix would agree with everything (see close)
+
     }
     if (deltas.size() < MIN_PAIRS || frustum == null) return new Estimate(null, deltas.size(), 0, frustum);
     // Vote: the delta the most pairs agree with (within tolerance) is the camera.
@@ -219,7 +240,14 @@ final class SkGfxCamera
 
   private static boolean close (double[] x, double[] y)
   {
-    for (int i = 0; i < 16; i++) if (Math.abs(x[i] - y[i]) > CLUSTER_TOLERANCE) return false;
+    // Written so that a NaN difference is "not close": every ordered comparison with NaN is false.
+    for (int i = 0; i < 16; i++) if (!(Math.abs(x[i] - y[i]) <= CLUSTER_TOLERANCE)) return false;
+    return true;
+  }
+
+  private static boolean finite (double[] m)
+  {
+    for (double v : m) if (!Double.isFinite(v)) return false;
     return true;
   }
 
@@ -264,7 +292,7 @@ final class SkGfxCamera
   {
     double a = m[0], b = m[4], c = m[8], d = m[1], e = m[5], f = m[9], g = m[2], h = m[6], i = m[10];
     double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if (Math.abs(det) < 1e-12) return null;
+    if (!(Math.abs(det) >= 1e-12)) return null; // also rejects NaN
     double[] r = identity();
     r[0] = (e * i - f * h) / det;
     r[4] = -(b * i - c * h) / det;
@@ -285,36 +313,45 @@ final class SkGfxCamera
   /**
    * The camera {@code s} of the way along its motion ({@code delta} to the power {@code s}): 0 is no motion, 1 is the
    * whole step, 0.5 the halfway pose, so {@code step(d, s) x step(d, 1 - s) = d}. Null when {@code delta} is not close to
-   * rigid (scale or shear) or turns by half a turn, in which case no in-between pose is trusted.
+   * rigid (scale, shear or a reflection) or turns by half a turn, in which case no in-between pose is trusted.
    */
   static double[] step (double[] delta, double s)
   {
-    // Rotation part must be orthonormal.
+    // Rotation part must be orthonormal (written so that NaN fails every test).
     double[] r = delta;
     for (int c = 0; c < 3; c++) {
       for (int k = c; k < 3; k++) {
         double dot = r[c * 4] * r[k * 4] + r[c * 4 + 1] * r[k * 4 + 1] + r[c * 4 + 2] * r[k * 4 + 2];
-        if (Math.abs(dot - (c == k ? 1 : 0)) > 0.02) return null;
+        if (!(Math.abs(dot - (c == k ? 1 : 0)) <= 0.02)) return null;
       }
     }
+    // ... and a rotation, not a reflection: an orthonormal matrix can also have determinant -1.
+    double det = r[0] * (r[5] * r[10] - r[9] * r[6]) - r[4] * (r[1] * r[10] - r[9] * r[2])
+      + r[8] * (r[1] * r[6] - r[5] * r[2]);
+    if (!(det > 0.95)) return null;
     double trace = r[0] + r[5] + r[10];
-    double angle = Math.acos(Math.max(-1, Math.min(1, (trace - 1) / 2)));
+    double ax = r[6] - r[9], ay = r[8] - r[2], az = r[1] - r[4];
+    double n = Math.sqrt(ax * ax + ay * ay + az * az); // 2 sin(angle)
+    // atan2 is exact near 0 and half a turn, where acos of a float32-noisy trace is not: noise of 1e-6 on the
+    // diagonal alone would read as a rotation of 1.7e-3 rad about an axis that is only noise.
+    double angle = Math.atan2(0.5 * n, 0.5 * (trace - 1));
     double tx = delta[12], ty = delta[13], tz = delta[14];
     double[] out = identity();
-    if (angle < 1e-9) { // a pure translation
+    if (angle < 1e-5) { // a pure translation (what is left of the rotation is rounding noise)
       out[12] = s * tx;
       out[13] = s * ty;
       out[14] = s * tz;
       return out;
     }
-    double ax = r[6] - r[9], ay = r[8] - r[2], az = r[1] - r[4];
-    double n = Math.sqrt(ax * ax + ay * ay + az * az);
-    if (n < 1e-9) return null; // 180 degrees: the axis is undefined, not a camera step
+    if (angle > Math.PI - 1e-3) return null; // half a turn: the axis is undefined, not a camera step
     ax /= n;
     ay /= n;
     az /= n;
     double phi = angle * s;
-    double c = Math.cos(phi), sn = Math.sin(phi), k = 1 - c;
+    double sn = Math.sin(phi);
+    double halfPhi = Math.sin(phi * 0.5);
+    double k = 2 * halfPhi * halfPhi; // 1 - cos(phi), without the cancellation
+    double c = 1 - k;
     out[0] = ax * ax * k + c;
     out[1] = ay * ax * k + az * sn;
     out[2] = az * ax * k - ay * sn;
@@ -328,10 +365,12 @@ final class SkGfxCamera
     // (1 - e^(i s theta)) / (1 - e^(i theta)) turns and scales the perpendicular part.
     double along = tx * ax + ty * ay + tz * az;
     double px = tx - along * ax, py = ty - along * ay, pz = tz - along * az;
-    double cosT = Math.cos(angle), sinT = Math.sin(angle);
-    double denominator = 2 * (1 - cosT);
-    double cr = ((1 - c) * (1 - cosT) + sn * sinT) / denominator;
-    double ci = ((1 - c) * sinT - sn * (1 - cosT)) / denominator;
+    double sinT = Math.sin(angle);
+    double halfAngle = Math.sin(angle * 0.5);
+    double oneMinusCosT = 2 * halfAngle * halfAngle;
+    double denominator = 2 * oneMinusCosT; // 2 (1 - cos(theta)) = 4 sin^2(theta / 2)
+    double cr = (k * oneMinusCosT + sn * sinT) / denominator;
+    double ci = (k * sinT - sn * oneMinusCosT) / denominator;
     // a x p turns the perpendicular part a quarter turn about the axis.
     double qx = ay * pz - az * py, qy = az * px - ax * pz, qz = ax * py - ay * px;
     out[12] = s * along * ax + cr * px + ci * qx;

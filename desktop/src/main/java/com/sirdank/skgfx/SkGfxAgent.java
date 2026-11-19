@@ -27,12 +27,13 @@ import java.util.jar.JarFile;
  *   <li>{@code GL11.glViewport/glScissor}: scaled while the game believes it is drawing to framebuffer 0, so the
  *       full-size layout it computes rasterizes into the scaled target. The game's believed sizes never change, so
  *       projection, UI layout and mouse picking stay exact; its own offscreen passes keep their real viewports.</li>
- *   <li>{@code GL11.glReadPixels/glCopyTexSubImage2D}: not replaced, but preceded by {@code SkGfxHook.beforeRead()}
+ *   <li>{@code GL11.glReadPixels/glCopyTexSubImage2D/glCopyTexImage2D/glCopyPixels} and {@code GL12.glCopyTexSubImage3D}: not replaced, but preceded by {@code SkGfxHook.beforeRead()}
  *       so a multisampled target is resolved before the game reads it.</li>
  * </ul>
  * Configured with system properties, passed next to the -javaagent line:
  * {@code skgfx.scale} (render scale, 0.25-4.0; above 1 supersamples, below 1 renders smaller and upscales),
- * {@code skgfx.sharpen} (0-1 contrast-adaptive sharpening), {@code skgfx.debugTint} (corner marker, for testing).
+ * {@code skgfx.sharpen} (0-1 contrast-adaptive sharpening), {@code skgfx.debugTint} (corner marker, for testing);
+ * the full list is the properties table in the README.
  */
 public final class SkGfxAgent
 {
@@ -209,6 +210,7 @@ public final class SkGfxAgent
   /** Matrix, bind and draw calls the camera estimator replays; hook signatures match the originals. */
   private static String cameraHook (InvokeInstruction call)
   {
+    if (call.opcode() != Opcode.INVOKESTATIC) return null;
     String owner = call.owner().asInternalName();
     String name = call.name().stringValue();
     String desc = call.type().stringValue();
@@ -247,13 +249,18 @@ public final class SkGfxAgent
   /** Calls that read the bound framebuffer; the hook runs first so a multisampled target is resolved. */
   private static boolean isReadBack (InvokeInstruction call)
   {
-    return call.opcode() == Opcode.INVOKESTATIC && call.owner().asInternalName().equals(GL11)
-      && (call.name().stringValue().equals("glReadPixels") || call.name().stringValue().equals("glCopyTexSubImage2D"));
+    if (call.opcode() != Opcode.INVOKESTATIC) return false;
+    String owner = call.owner().asInternalName();
+    String name = call.name().stringValue();
+    if (owner.equals(GL12)) return name.equals("glCopyTexSubImage3D");
+    return owner.equals(GL11) && (name.equals("glReadPixels") || name.equals("glCopyTexSubImage2D")
+      || name.equals("glCopyTexImage2D") || name.equals("glCopyPixels"));
   }
 
   /** The SkGfxHook method replacing this call, or null for calls left alone. Hook signatures match the originals. */
   private static String hookMethod (InvokeInstruction call, boolean hudSplit)
   {
+    if (call.opcode() != Opcode.INVOKESTATIC) return null;
     String owner = call.owner().asInternalName();
     String name = call.name().stringValue();
     String desc = call.type().stringValue();

@@ -51,7 +51,10 @@ public class SkGfxAgentTest
   @Test
   public void rewritesInterceptedCallSitesOnly ()
   {
-    List<String> owners = invokedOwners(SkGfxAgent.rewrite(fakeGameClass()));
+    // Explicit flags: the one-argument overload reads JVM-wide properties (-Dskgfx.fg=true would change the result).
+    byte[] out = SkGfxAgent.rewrite(fakeGameClass(), false, false, false);
+    List<String> owners = invokedOwners(out);
+    assertTrue(ClassFile.of().verify(out).isEmpty());
     String hook = "com/sirdank/skgfx/SkGfxHook";
     assertTrue(owners.contains(hook + ".swapBuffers"));
     assertTrue(owners.contains(hook + ".viewport"));
@@ -64,7 +67,7 @@ public class SkGfxAgentTest
   @Test
   public void traceModeLogsEveryStaticGlCallAndStaysVerifiable ()
   {
-    byte[] out = SkGfxAgent.rewrite(fakeGameClass(), true);
+    byte[] out = SkGfxAgent.rewrite(fakeGameClass(), true, false, false);
     List<String> owners = invokedOwners(out);
     // glBindTexture is not an intercepted hook, but trace mode must still log it (and still make the call).
     assertTrue(owners.contains("org/lwjgl/opengl/GL11.glBindTexture"));
@@ -73,7 +76,7 @@ public class SkGfxAgentTest
     assertTrue(owners.contains("com/sirdank/skgfx/SkGfxHook.viewport"));
     assertTrue(ClassFile.of().verify(out).isEmpty());
     // Without trace the logger is not referenced at all.
-    assertFalse(invokedOwners(SkGfxAgent.rewrite(fakeGameClass(), false)).stream().anyMatch(o -> o.contains("SkGfxTrace")));
+    assertFalse(invokedOwners(SkGfxAgent.rewrite(fakeGameClass(), false, false, false)).stream().anyMatch(o -> o.contains("SkGfxTrace")));
   }
 
   @Test
@@ -86,9 +89,31 @@ public class SkGfxAgentTest
           MethodTypeDesc.ofDescriptor("(IIIIIIII)V"));
         code.return_();
       }));
-    byte[] out = SkGfxAgent.rewrite(copier);
+    byte[] out = SkGfxAgent.rewrite(copier, false, false, false);
     List<String> owners = invokedOwners(out);
     assertEquals(List.of("com/sirdank/skgfx/SkGfxHook.beforeRead", "org/lwjgl/opengl/GL11.glCopyTexSubImage2D"), owners);
+    assertTrue(ClassFile.of().verify(out).isEmpty());
+  }
+
+  @Test
+  public void everyFramebufferCopyOrReadIsPrecededByTheResolveHook ()
+  {
+    ClassDesc gl11 = ClassDesc.ofInternalName("org/lwjgl/opengl/GL11");
+    ClassDesc gl12 = ClassDesc.ofInternalName("org/lwjgl/opengl/GL12");
+    byte[] game = ClassFile.of().build(ClassDesc.of("fake.Readers"), cb -> cb
+      .withMethodBody("read", MethodTypeDesc.ofDescriptor("()V"), ACC_PUBLIC | ACC_STATIC, code -> {
+        code.iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0()
+          .invokestatic(gl11, "glCopyTexImage2D", MethodTypeDesc.ofDescriptor("(IIIIIIII)V"));
+        code.iconst_0().iconst_0().iconst_0().iconst_0().iconst_0()
+          .invokestatic(gl11, "glCopyPixels", MethodTypeDesc.ofDescriptor("(IIIII)V"));
+        code.iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0().iconst_0()
+          .invokestatic(gl12, "glCopyTexSubImage3D", MethodTypeDesc.ofDescriptor("(IIIIIIIII)V"));
+        code.return_();
+      }));
+    byte[] out = SkGfxAgent.rewrite(game, false, false, false);
+    assertEquals(List.of("com/sirdank/skgfx/SkGfxHook.beforeRead", "org/lwjgl/opengl/GL11.glCopyTexImage2D",
+      "com/sirdank/skgfx/SkGfxHook.beforeRead", "org/lwjgl/opengl/GL11.glCopyPixels",
+      "com/sirdank/skgfx/SkGfxHook.beforeRead", "org/lwjgl/opengl/GL12.glCopyTexSubImage3D"), invokedOwners(out));
     assertTrue(ClassFile.of().verify(out).isEmpty());
   }
 
@@ -223,8 +248,8 @@ public class SkGfxAgentTest
     byte[] plain = ClassFile.of().build(ClassDesc.of("fake.Plain"), cb -> cb
       .withMethodBody("noop", MethodTypeDesc.ofDescriptor("()V"), ACC_PUBLIC | ACC_STATIC,
         code -> code.return_()));
-    assertFalse(SkGfxAgent.mentionsInterceptedOwner(plain));
-    assertNull(SkGfxAgent.rewrite(plain));
+    assertFalse(SkGfxAgent.mentionsInterceptedOwner(plain, false));
+    assertNull(SkGfxAgent.rewrite(plain, false, false, false));
     // A class that mentions GL11 but only calls untouched methods is also left alone.
     byte[] textureOnly = ClassFile.of().build(ClassDesc.of("fake.Textures"), cb -> cb
       .withMethodBody("bind", MethodTypeDesc.ofDescriptor("()V"), ACC_PUBLIC | ACC_STATIC, code -> code
@@ -232,8 +257,8 @@ public class SkGfxAgentTest
         .invokestatic(ClassDesc.ofInternalName("org/lwjgl/opengl/GL11"), "glBindTexture",
           MethodTypeDesc.ofDescriptor("(II)V"))
         .return_()));
-    assertTrue(SkGfxAgent.mentionsInterceptedOwner(textureOnly));
-    assertNull(SkGfxAgent.rewrite(textureOnly));
-    assertTrue(SkGfxAgent.mentionsInterceptedOwner(fakeGameClass()));
+    assertTrue(SkGfxAgent.mentionsInterceptedOwner(textureOnly, false));
+    assertNull(SkGfxAgent.rewrite(textureOnly, false, false, false));
+    assertTrue(SkGfxAgent.mentionsInterceptedOwner(fakeGameClass(), false));
   }
 }

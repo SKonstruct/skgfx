@@ -51,4 +51,31 @@ public class SkGfxPacerTest
     assertEquals(12_000_000L, SkGfxPacer.spinMargin(15_600_000L));
     assertTrue(SkGfxPacer.spinMargin(5_000_000L) > SkGfxPacer.spinMargin(2_000_000L));
   }
+
+  @Test
+  public void propertyValuesThatAreNotFiniteNumbersAreIgnored ()
+  {
+    assertEquals(2.0, SkGfxPacer.finiteOr(null, 2.0));
+    assertEquals(2.0, SkGfxPacer.finiteOr("NaN", 2.0));
+    assertEquals(2.0, SkGfxPacer.finiteOr("Infinity", 2.0));
+    assertEquals(2.0, SkGfxPacer.finiteOr("-Infinity", 2.0));
+    assertEquals(2.0, SkGfxPacer.finiteOr("fast", 2.0));
+    assertEquals(1.5, SkGfxPacer.finiteOr(" 1.5 ", 2.0));
+  }
+
+  @Test
+  public void aWindowedGameUsesTheRefreshRateOfTheMonitorItIsOn ()
+  {
+    int[][] monitors = {{0, 0, 1920, 1080}, {1920, 0, 2560, 1440}};
+    assertEquals(0, SkGfxPacer.bestMonitor(100, 100, 1280, 720, monitors));
+    assertEquals(1, SkGfxPacer.bestMonitor(2000, 50, 1280, 720, monitors));
+    // Straddling the two: the one with more of the window.
+    assertEquals(1, SkGfxPacer.bestMonitor(1500, 0, 1280, 720, monitors));
+    assertEquals(0, SkGfxPacer.bestMonitor(800, 0, 1280, 720, monitors));
+    // Left of the first monitor (negative coordinates) or nowhere: none, the caller falls back to the primary.
+    assertEquals(-1, SkGfxPacer.bestMonitor(-5000, 0, 800, 600, monitors));
+    assertEquals(0, SkGfxPacer.bestMonitor(-700, 0, 800, 600, new int[][] {{-1920, 0, 1920, 1080}, {0, 0, 1920, 1080}}),
+      "a monitor to the left of the origin is found too");
+    assertEquals(-1, SkGfxPacer.bestMonitor(0, 0, 0, 0, monitors), "an empty window overlaps nothing");
+  }
 }

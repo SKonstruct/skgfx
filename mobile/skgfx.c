@@ -1,4 +1,4 @@
-// SKapsule's graphics present pass. See skgfx.h. Shared with SKapsule-iOS: keep the two copies in step.
+// SKapsule's graphics present pass. See skgfx.h. The single source for SKapsule (Android) and SKapsule-iOS.
 //
 // The game believes it draws into the window (framebuffer 0). gl4es maps that to a framebuffer we
 // choose (gl4es_skgfx_set_main_framebuffer), so the game lands in our scene target; at swap time one
@@ -127,8 +127,10 @@ static struct {
     GLuint prog_cas, prog_copy, vbo;
     GLint cas_tex, cas_texel, cas_sharp, copy_tex;
     int world_draws;
-    // What the game believes it set, so the scene's state can be put back after the HUD layer.
+    // What the game believes it set, so the scene's state can be put back after the HUD layer. A zero-sized scissor is
+    // a real setting (it clips everything), so whether one was recorded is a flag, not a size above zero.
     GLint bvx, bvy, bvw, bvh, bsx, bsy, bsw, bsh;
+    int have_vp, have_sc;
     GLenum bblend_s, bblend_d;
     int errors_logged;
     gl4es_hooks_t *hooks;
@@ -141,12 +143,23 @@ static struct {
 
 static int drain_errors(const char *where) {
     int n = 0;
-    while (glGetError() != GL_NO_ERROR && n < 16) n++;
+    GLenum first = GL_NO_ERROR, e;
+    while ((e = glGetError()) != GL_NO_ERROR && n < 16) {
+        if (!n) first = e;
+        n++;
+    }
     if (n && !g.errors_logged) {
         g.errors_logged = 1;
-        SKLOG("GL errors after %s (logged once)", where);
+        SKLOG("GL error 0x%x (%d in all) after %s (logged once)", (unsigned)first, n, where);
     }
     return n;
+}
+
+// Errors the game (or gl4es) left in the queue are not ours: clear them before our own GL work, so only our own
+// calls can make a following drain_errors() fail the pass.
+static void clear_pending_errors(void) {
+    int n = 0;
+    while (glGetError() != GL_NO_ERROR && n < 16) n++;
 }
 
 // --- shaders ----------------------------------------------------------------------------------
@@ -176,15 +189,21 @@ static const char *CAS_SRC =
     "  vec3 h = texture2D(uTex, vUv + vec2(0.0, uTexel.y)).rgb;\n"
     "  vec3 mn = min(min(min(d, e), min(f, b)), h);\n"
     "  vec3 mx = max(max(max(d, e), max(f, b)), h);\n"
-    "  vec3 amp = clamp(min(mn, 1.0 - mx) / (mx + 1e-5), 0.0, 1.0);\n"
+    "  vec3 amp = clamp(min(mn, 1.0 - mx) / (mx + 1e-4), 0.0, 1.0);\n"
     "  amp = sqrt(amp);\n"
     "  float peak = -1.0 / mix(8.0, 5.0, uSharp);\n"
     "  vec3 w = amp * peak;\n"
-    "  gl_FragColor = vec4(((b + d + f + h) * w + e) / (4.0 * w + 1.0), 1.0);\n"
+    "  gl_FragColor = vec4(clamp(((b + d + f + h) * w + e) / (4.0 * w + 1.0), 0.0, 1.0), 1.0);\n"
     "}\n";
 
+// The HUD layer is sampled with the same vUv as the scene: mediump (fp16) would quantise it to 1/1024 steps across
+// the right half of a wide screen, so it asks for highp like CAS_SRC does.
 static const char *COPY_SRC =
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+    "precision highp float;\n"
+    "#else\n"
     "precision mediump float;\n"
+    "#endif\n"
     "uniform sampler2D uTex;\n"
     "varying vec2 vUv;\n"
     "void main() { gl_FragColor = texture2D(uTex, vUv); }\n";
@@ -207,7 +226,11 @@ static GLuint compile(GLenum type, const char *src) {
 
 static GLuint link_program(const char *frag) {
     GLuint v = compile(GL_VERTEX_SHADER, VERT_SRC), f = compile(GL_FRAGMENT_SHADER, frag);
-    if (!v || !f) return 0;
+    if (!v || !f) {
+        if (v) glDeleteShader(v);
+        if (f) glDeleteShader(f);
+        return 0;
+    }
     GLuint p = glCreateProgram();
     glAttachShader(p, v);
     glAttachShader(p, f);
@@ -232,6 +255,7 @@ static GLuint link_program(const char *frag) {
 // name never changes, so what gl4es holds stays valid across a resize.
 static int target_resize(target_t *t, int w, int h) {
     GLint prev_fbo = 0, prev_tex = 0, prev_rb = 0;
+    clear_pending_errors();
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
     glGetIntegerv(GL_RENDERBUFFER_BINDING, &prev_rb);
@@ -275,10 +299,18 @@ static void target_free(target_t *t) {
 
 // --- the game's GL calls, as seen through gl4es -----------------------------------------------
 static int round_pos(GLint v, float f) { return (int)(v * f + (v < 0 ? -0.5f : 0.5f)); }
+// A viewport or scissor may be empty (an empty scissor clips everything): zero stays zero, a real size never
+// rounds to nothing. (Targets are never empty: scaled_dim.)
 static int round_size(GLsizei v, float f) {
+    if (v <= 0) return (int)v;
     int r = (int)(v * f + 0.5f);
     return r < 1 ? 1 : r;
 }
+
+// Alpha blend factors for the HUD layer's coverage: it accumulates (over), except under additive blending
+// (destination factor ONE: glow adds colour and covers nothing, or it would darken the scene behind it).
+static GLenum coverage_src_alpha(GLenum dfactor) { return dfactor == GL_ONE ? GL_ZERO : GL_ONE; }
+static GLenum coverage_dst_alpha(GLenum dfactor) { return dfactor == GL_ONE ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA; }
 
 static void h_draw(int depth_test) {
     if (depth_test) g.world_draws++;
@@ -287,6 +319,7 @@ static void h_draw(int depth_test) {
 static void h_viewport(int on_default, GLint *x, GLint *y, GLsizei *w, GLsizei *h) {
     if (g.bypass || !on_default) return;
     g.bvx = *x; g.bvy = *y; g.bvw = *w; g.bvh = *h;
+    g.have_vp = 1;
     if (g.engaged && g.hud_eff && !g.ui_active) {
         *x = round_pos(*x, g.fx); *y = round_pos(*y, g.fy);
         *w = round_size(*w, g.fx); *h = round_size(*h, g.fy);
@@ -296,6 +329,7 @@ static void h_viewport(int on_default, GLint *x, GLint *y, GLsizei *w, GLsizei *
 static void h_scissor(int on_default, GLint *x, GLint *y, GLsizei *w, GLsizei *h) {
     if (g.bypass || !on_default) return;
     g.bsx = *x; g.bsy = *y; g.bsw = *w; g.bsh = *h;
+    g.have_sc = 1;
     if (g.engaged && g.hud_eff && !g.ui_active) {
         *x = round_pos(*x, g.fx); *y = round_pos(*y, g.fy);
         *w = round_size(*w, g.fx); *h = round_size(*h, g.fy);
@@ -307,7 +341,7 @@ static int h_blendfunc(GLenum s, GLenum d) {
     g.bblend_d = d;
     if (g.ui_active) {
         // The HUD layer starts transparent: colour blends as the game asked, alpha accumulates as coverage.
-        g.glBlendFuncSeparate(s, d, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        g.glBlendFuncSeparate(s, d, coverage_src_alpha(d), coverage_dst_alpha(d));
         return 1;
     }
     return 0;
@@ -330,12 +364,14 @@ static void begin_ui(void) {
         announced = 1;
         SKLOG("HUD layer starts after %d depth-tested draws", g.world_draws);
     }
-    GLboolean cmask[4], dmask, scissor = glIsEnabled(GL_SCISSOR_TEST);
-    GLint smask = 0, sclear = 0;
-    GLfloat ccol[4], dclear = 1.0f;
+    // Defaults for what a failed query leaves untouched, so nothing uninitialised is replayed below.
+    GLboolean cmask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE }, dmask = GL_TRUE, scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLint smask = 0xFF, smask_back = 0xFF, sclear = 0;
+    GLfloat ccol[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, dclear = 1.0f;
     glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
     glGetIntegerv(GL_STENCIL_WRITEMASK, &smask);
+    glGetIntegerv(GL_STENCIL_BACK_WRITEMASK, &smask_back);
     glGetFloatv(GL_COLOR_CLEAR_VALUE, ccol);
     glGetFloatv(GL_DEPTH_CLEAR_VALUE, &dclear);
     glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &sclear);
@@ -350,17 +386,21 @@ static void begin_ui(void) {
     glClearColor(ccol[0], ccol[1], ccol[2], ccol[3]);
     glClearDepthf(dclear);
     glClearStencil(sclear);
-    glStencilMask((GLuint)smask);
+    glStencilMaskSeparate(GL_FRONT, (GLuint)smask);
+    glStencilMaskSeparate(GL_BACK, (GLuint)smask_back);
     glDepthMask(dmask);
     glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
     if (scissor) glEnable(GL_SCISSOR_TEST);
     drain_errors("HUD begin");
-    // The game believes the viewport is unchanged and will not issue it again.
+    // The game believes its viewport and scissor are unchanged and will not issue them again: the scene's were
+    // scaled, so put back what it set (the whole window when it never set a viewport).
     g.bypass = 1;
-    g.glViewport(0, 0, g.nw, g.nh);
+    if (g.have_vp) g.glViewport(g.bvx, g.bvy, g.bvw, g.bvh);
+    else g.glViewport(0, 0, g.nw, g.nh);
+    if (g.have_sc) g.glScissor(g.bsx, g.bsy, g.bsw, g.bsh);
     g.bypass = 0;
     g.ui_active = 1;
-    g.glBlendFuncSeparate(g.bblend_s, g.bblend_d, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    g.glBlendFuncSeparate(g.bblend_s, g.bblend_d, coverage_src_alpha(g.bblend_d), coverage_dst_alpha(g.bblend_d));
 }
 
 static void h_ortho(double l, double r, double b, double t, int on_default) {
@@ -372,10 +412,32 @@ static void h_ortho(double l, double r, double b, double t, int on_default) {
 }
 
 // --- engaging and resizing --------------------------------------------------------------------
+// The viewport and scissor the game believes it has set, put back as they are (the hooks must not scale them).
+static void apply_game_state(void) {
+    g.bypass = 1;
+    if (g.have_vp) g.glViewport(g.bvx, g.bvy, g.bvw, g.bvh);
+    if (g.have_sc) g.glScissor(g.bsx, g.bsy, g.bsw, g.bsh);
+    g.bypass = 0;
+}
+
+// The same, scaled to the scene target the game is drawing into while Sharp HUD keeps its own size unscaled.
+static void apply_scene_state(void) {
+    if (!g.engaged || !g.hud_eff || g.ui_active) return;
+    g.bypass = 1;
+    if (g.have_vp) g.glViewport(round_pos(g.bvx, g.fx), round_pos(g.bvy, g.fy), round_size(g.bvw, g.fx), round_size(g.bvh, g.fy));
+    else g.glViewport(0, 0, g.scene.w, g.scene.h);
+    if (g.have_sc) g.glScissor(round_pos(g.bsx, g.fx), round_pos(g.bsy, g.fy), round_size(g.bsw, g.fx), round_size(g.bsh, g.fy));
+    g.bypass = 0;
+}
+
 static void disengage(unsigned window_fbo) {
     if (g.engaged) {
         SKLOG("disengaged: the game draws into the window again");
         g.set_main_fb(window_fbo);
+        // Whatever the hooks changed behind the game's back goes back to what it believes: its plain blend function
+        // after the HUD layer, and its own (unscaled) viewport and scissor after the scene's scaled ones.
+        if (g.ui_active) g.glBlendFunc(g.bblend_s, g.bblend_d);
+        if (g.hud_eff && !g.ui_active) apply_game_state();
     }
     g.engaged = 0;
     g.ui_active = 0;
@@ -503,7 +565,8 @@ static int timing_enabled(void) {
         char value[PROP_VALUE_MAX] = {0};
         on = __system_property_get("debug.skgfx.time", value) > 0 && value[0] == '1';
 #else
-        on = getenv("SKGFX_TIME") != NULL;
+        const char *value = getenv("SKGFX_TIME");
+        on = value && value[0] == '1';  // SKGFX_TIME=0 (or empty) is off, as on Android
 #endif
     }
     return on;
@@ -578,22 +641,23 @@ int skgfx_present(unsigned window_fbo, int nw, int nh) {
 
 void skgfx_after_swap(unsigned window_fbo, int nw, int nh) {
     if (!g.ready) return;
-    if (g.ui_active) {
-        // The HUD layer is over: the game goes back to the scene, with the scene's viewport, scissor
-        // and blend function (it does not repeat them).
-        g.ui_active = 0;
-        g.set_main_fb(g.scene.fbo);
-        g.bypass = 1;
-        if (g.bvw > 0) g.glViewport(round_pos(g.bvx, g.fx), round_pos(g.bvy, g.fy), round_size(g.bvw, g.fx), round_size(g.bvh, g.fy));
-        if (g.bsw > 0) g.glScissor(round_pos(g.bsx, g.fx), round_pos(g.bsy, g.fy), round_size(g.bsw, g.fx), round_size(g.bsh, g.fy));
-        g.bypass = 0;
-        g.glBlendFunc(g.bblend_s, g.bblend_d);
-    }
+    int was_ui = g.ui_active;
+    int was_engaged = g.engaged, was_hud = g.hud_eff;
+    float was_fx = g.fx, was_fy = g.fy;
     g.world_draws = 0;
-    reconfigure(window_fbo, nw, nh);
-    // Anything else on this thread may have rebound a framebuffer since (SKapsule-iOS rebuilds the
-    // window's renderbuffers between frames), so say where the game draws, every frame.
-    if (g.engaged && !g.ui_active) g.set_main_fb(g.scene.fbo);
+    reconfigure(window_fbo, nw, nh);  // may disengage (and then undo the HUD's blend function itself)
+    if (g.engaged) {
+        // The HUD layer is over: the game goes back to the scene, with the scene's viewport, scissor and blend
+        // function (it does not repeat them). The same when the scene was just engaged or its size changed.
+        g.ui_active = 0;
+        // Anything else on this thread may have rebound a framebuffer since (SKapsule-iOS rebuilds the window's
+        // renderbuffers between frames), so say where the game draws, every frame.
+        g.set_main_fb(g.scene.fbo);
+        if (was_ui) g.glBlendFunc(g.bblend_s, g.bblend_d);
+        if (was_ui || !was_engaged || was_hud != g.hud_eff || was_fx != g.fx || was_fy != g.fy) apply_scene_state();
+    } else {
+        g.ui_active = 0;
+    }
 }
 
 // --- setup ------------------------------------------------------------------------------------
@@ -620,6 +684,7 @@ int skgfx_init(void *h) {
         atomic_store(&cfg_failed, 1);
         return 0;
     }
+    clear_pending_errors();
     const char *ext = (const char *)glGetString(GL_EXTENSIONS);
     const char *ver = (const char *)glGetString(GL_VERSION);
     g.packed_ds = (ext && strstr(ext, "GL_OES_packed_depth_stencil")) || (ver && strstr(ver, "OpenGL ES 3"));
@@ -646,6 +711,11 @@ int skgfx_init(void *h) {
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prev_buf);
     glUseProgram((GLuint)prev_prog);
     if (!ok || drain_errors("init")) {
+        // Nothing of the half-built pass stays behind: the programs and the buffer go back to GL.
+        if (g.prog_cas) glDeleteProgram(g.prog_cas);
+        if (g.prog_copy) glDeleteProgram(g.prog_copy);
+        if (g.vbo) glDeleteBuffers(1, &g.vbo);
+        g.prog_cas = g.prog_copy = g.vbo = 0;
         atomic_store(&cfg_failed, 1);
         return 0;
     }

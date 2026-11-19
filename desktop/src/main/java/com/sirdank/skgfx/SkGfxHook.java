@@ -18,7 +18,6 @@ public final class SkGfxHook
   static final boolean DEBUG_TINT = Boolean.getBoolean("skgfx.debugTint");
   /** Frame-generation prototype: show a blend of the previous and current frame between real frames. */
   static final boolean FRAME_GEN = Boolean.getBoolean("skgfx.fg");
-  /** Log real fps and swap spacing every few seconds (the baseline for judging frame generation). */
   /**
    * Splits the game's HUD from its 3D scene: the HUD pass is redirected into its own transparent layer at full
    * resolution and composited over the (scaled, possibly generated) scene at present time.
@@ -26,9 +25,8 @@ public final class SkGfxHook
   static final boolean HUD_SPLIT = FRAME_GEN || Boolean.getBoolean("skgfx.hudsplit");
   /** Depth-tested draws needed before an orthographic pass counts as the HUD (a 2D background comes first on menus). */
   private static final int MIN_WORLD_DRAWS = 20;
+  /** Log real fps and swap spacing every few seconds (only when asked for with skgfx.stats, or frame generation is on). */
   static final boolean STATS = FRAME_GEN || Boolean.getBoolean("skgfx.stats");
-  /** Print the timing report every few seconds (only when asked for with skgfx.stats, or frame generation is on). */
-  static final boolean STATS_LOG = STATS;
   /** The fps counter in the window's top left corner; on unless {@code -Dskgfx.counter=false}. */
   static final boolean COUNTER = !"false".equalsIgnoreCase(System.getProperty("skgfx.counter"));
 
@@ -40,7 +38,7 @@ public final class SkGfxHook
 
   private static final double[] NO_PHASES = new double[0];
   private static boolean swapIntervalForced;
-  private static boolean overlayFailed;
+  private static volatile boolean overlayFailed;
   // Plain direct buffers: the class initializer runs during the agent's start-up, before the game's LWJGL is
   // necessarily visible, so it must not need LWJGL classes.
   private static final java.nio.IntBuffer sizeWidth = java.nio.ByteBuffer.allocateDirect(4)
@@ -55,10 +53,41 @@ public final class SkGfxHook
       GLFW.glfwGetFramebufferSize(window, sizeWidth, sizeHeight);
       SkGfxOverlay.draw(text, Math.max(1, sizeWidth.get(0)), Math.max(1, sizeHeight.get(0)), false);
     } catch (Throwable t) {
-      overlayFailed = true;
-      System.err.println("[skgfx] counter disabled after error: " + t);
+      overlayFailed(t);
     }
   }
+
+  /** The counter could not be drawn: it stays off for the rest of the run (and is not retried every frame). */
+  static void overlayFailed (Throwable t)
+  {
+    overlayFailed = true;
+    System.err.println("[skgfx] counter disabled after error: " + t);
+  }
+
+  static boolean overlayFailed ()
+  {
+    return overlayFailed;
+  }
+
+  /** Whether any of this real frame's outputs is a generated one (the counter shows green while it is). */
+  static boolean generating (double[] phases)
+  {
+    for (double phase : phases) if (phase < 0.9999) return true;
+    return false;
+  }
+
+  /** The HUD layer ended, or a resize tore it down while it was open: either way the scene's GL state is put back. */
+  static boolean sceneNeedsRestoring (boolean hudBeforePrepare, boolean hudAfter)
+  {
+    return hudBeforePrepare || hudAfter;
+  }
+
+  /** A swap on a window other than the last one: the game recreated its window (and so its GL context). */
+  static boolean isNewWindow (long last, long now)
+  {
+    return last != 0 && now != 0 && last != now;
+  }
+
   /** Test aid: {@code -Dskgfx.gpuTime=true} measures the GPU time of our passes (stalls the pipeline; for measuring only). */
   private static final boolean GPU_TIME = Boolean.getBoolean("skgfx.gpuTime");
 
@@ -78,22 +107,30 @@ public final class SkGfxHook
   public static void swapBuffers (long window)
   {
     if (SkGfxTrace.ENABLED) SkGfxTrace.onSwap();
+    checkContext(window);
     SkGfxPacer p = pacer;
     boolean mayGenerate = p != null && p.beginFrame(window);
     String counter = COUNTER && !overlayFailed && p != null ? p.counterText() : null;
     SkGfxCamera.Estimate camera = null;
-    if (CAMERA != null) {
+    if (cameraOn) {
       // Camera change between the previous frame and this one, from the world draws recorded this frame.
-      trackCamera();
-      camera = debugEstimate(CAMERA.estimate());
+      try {
+        trackCamera();
+        camera = debugEstimate(CAMERA.estimate());
+      } catch (Throwable t) {
+        cameraFailed(t);
+      }
     }
+    // A resize while the HUD is open drops the HUD layer (and with it the answer to "was this a HUD frame"): ask first.
+    boolean hudBefore = pipeline != null && pipeline.inUi();
     if (active) {
       try {
         if (pipeline == null) pipeline = new SkGfxPipeline();
-        pipeline.setOverlay(counter, FRAME_GEN);
+        pipeline.setOverlay(counter, false);
         if (pipeline.prepare(window)) {
           double[] phases = FRAME_GEN && p != null && pipeline.canBlend() && SkGfxPipeline.blitAvailable()
             ? p.plan(mayGenerate) : NO_PHASES;
+          pipeline.setOverlay(counter, generating(phases));
           if (phases.length > 0) {
             // The frames to show for this real frame, each the scene at its own phase between the previous real frame
             // and this one (1.0 is this one itself), a gap apart. The last is shown by the swap at the end of this
@@ -148,9 +185,9 @@ public final class SkGfxHook
     }
     if (active) {
       try {
-        boolean hud = pipeline.inUi();
+        boolean hud = sceneNeedsRestoring(hudBefore, pipeline.inUi());
         pipeline.endUi();
-        pipeline.afterSwap(window);
+        pipeline.afterSwap();
         if (hud) restoreSceneState();
       } catch (Throwable t) {
         disable(t);
@@ -163,17 +200,57 @@ public final class SkGfxHook
     }
   }
 
+  private static long lastWindow;
+
+  /**
+   * The game destroyed its window and made another (a fullscreen or MSAA change): our GL objects belong to the dead
+   * context. They are forgotten, not deleted (their names mean something else in the new context), and rebuilt.
+   */
+  private static void checkContext (long window)
+  {
+    if (isNewWindow(lastWindow, window) && pipeline != null) {
+      System.err.println("[skgfx] the game's window was recreated: building the offscreen target again");
+      pipeline = null;
+      SkGfxPipeline.forgetContext();
+      swapIntervalForced = false;
+      blendSeparate = null;
+      onDefaultFramebuffer = true;
+      depthTest = false;
+      worldDraws = 0;
+      if (pacer != null) pacer.windowChanged();
+    }
+    if (window != 0) lastWindow = window;
+  }
+
   /** Whether the game believes framebuffer 0 (the window) is bound. Only touched on the render thread. */
   private static boolean onDefaultFramebuffer = true;
 
   /** The game binds framebuffer 0 to draw to the screen: give it the offscreen framebuffer instead. */
   public static void bindFramebuffer (int target, int framebuffer)
   {
-    onDefaultFramebuffer = framebuffer == 0;
+    boolean reads = target == GL_READ_FRAMEBUFFER;
+    // Only a bind that sets the draw framebuffer says where the game draws.
+    if (!reads) onDefaultFramebuffer = framebuffer == 0;
     if (active && framebuffer == 0 && pipeline != null) {
-      framebuffer = pipeline.framebuffer();
+      checkContext(GLFW.glfwGetCurrentContext());
+      if (pipeline != null) framebuffer = redirected(target, framebuffer, pipeline.framebuffer(), pipeline.readFramebuffer());
     }
     GL30.glBindFramebuffer(target, framebuffer);
+    // The HUD layer's alpha rule belongs to the HUD layer only, not to a framebuffer of the game's own.
+    if (!reads && inUi()) applyBlend();
+  }
+
+  static final int GL_READ_FRAMEBUFFER = 0x8CA8;
+
+  /**
+   * What the game's bind of {@code framebuffer} really binds: for the window (0) the offscreen target, which is the
+   * multisampled one to draw into but the resolved single-sample one to read from (a multisampled framebuffer cannot be
+   * read back).
+   */
+  static int redirected (int target, int framebuffer, int drawTarget, int readTarget)
+  {
+    if (framebuffer != 0) return framebuffer;
+    return target == GL_READ_FRAMEBUFFER ? readTarget : drawTarget;
   }
 
   /**
@@ -199,8 +276,9 @@ public final class SkGfxHook
   public static void viewport (int x, int y, int width, int height)
   {
     vx = x; vy = y; vw = width; vh = height;
+    haveViewport = true;
     if (active && onDefaultFramebuffer && !inUi()) {
-      GL11.glViewport(scaledPos(x), scaledPos(y), scaled(width), scaled(height));
+      GL11.glViewport(scaledPos(x), scaledPos(y), scaledRect(width, SCALE), scaledRect(height, SCALE));
     } else {
       GL11.glViewport(x, y, width, height);
     }
@@ -209,8 +287,9 @@ public final class SkGfxHook
   public static void scissor (int x, int y, int width, int height)
   {
     sx = x; sy = y; sw = width; sh = height;
+    haveScissor = true;
     if (active && onDefaultFramebuffer && !inUi()) {
-      GL11.glScissor(scaledPos(x), scaledPos(y), scaled(width), scaled(height));
+      GL11.glScissor(scaledPos(x), scaledPos(y), scaledRect(width, SCALE), scaledRect(height, SCALE));
     } else {
       GL11.glScissor(x, y, width, height);
     }
@@ -218,7 +297,9 @@ public final class SkGfxHook
 
   // ---- HUD split: state the game believes it has, kept so it can be put back when the HUD layer ends.
   private static int vx, vy, vw, vh, sx, sy, sw, sh;
-  private static int blendSrc = GL11.GL_SRC_ALPHA, blendDst = GL11.GL_ONE_MINUS_SRC_ALPHA;
+  private static boolean haveViewport, haveScissor;
+  // What GL starts with: until the game says otherwise this is what it has.
+  private static int blendSrc = GL11.GL_ONE, blendDst = GL11.GL_ZERO;
   private static boolean depthTest;
   private static int worldDraws;
   private static boolean hudAnnounced;
@@ -272,84 +353,128 @@ public final class SkGfxHook
 
   // ---- camera tracking (frame generation): replays the game's matrix, bind and draw calls.
   static final SkGfxCamera CAMERA = FRAME_GEN ? new SkGfxCamera() : null;
+  /** Camera tracking is on until it fails once or the pipeline is disabled; the real GL calls always go through. */
+  private static volatile boolean cameraOn = CAMERA != null;
+
+  /** The camera replay threw: tracking stops (the game's own GL calls are unaffected), frames are still presented. */
+  static void cameraFailed (Throwable t)
+  {
+    if (cameraOn) System.err.println("[skgfx] camera tracking stopped after error: " + t);
+    cameraOn = false;
+  }
+
+  static boolean cameraTracking ()
+  {
+    return cameraOn;
+  }
 
   public static void matrixMode (int mode)
   {
-    CAMERA.matrixMode(mode);
+    if (cameraOn) {
+      try { CAMERA.matrixMode(mode); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glMatrixMode(mode);
   }
 
   public static void loadIdentity ()
   {
-    CAMERA.loadIdentity();
+    if (cameraOn) {
+      try { CAMERA.loadIdentity(); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glLoadIdentity();
   }
 
   public static void pushMatrix ()
   {
-    CAMERA.push();
+    if (cameraOn) {
+      try { CAMERA.push(); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glPushMatrix();
   }
 
   public static void popMatrix ()
   {
-    CAMERA.pop();
+    if (cameraOn) {
+      try { CAMERA.pop(); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glPopMatrix();
   }
 
   public static void translatef (float x, float y, float z)
   {
-    CAMERA.translate(x, y, z);
+    if (cameraOn) {
+      try { CAMERA.translate(x, y, z); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glTranslatef(x, y, z);
   }
 
   public static void scalef (float x, float y, float z)
   {
-    CAMERA.scale(x, y, z);
+    if (cameraOn) {
+      try { CAMERA.scale(x, y, z); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glScalef(x, y, z);
   }
 
   public static void rotatef (float angle, float x, float y, float z)
   {
-    CAMERA.rotate(angle, x, y, z);
+    if (cameraOn) {
+      try { CAMERA.rotate(angle, x, y, z); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glRotatef(angle, x, y, z);
   }
 
   public static void loadMatrixf (java.nio.FloatBuffer m)
   {
-    CAMERA.load(m);
+    if (cameraOn) {
+      try { CAMERA.load(m); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glLoadMatrixf(m);
   }
 
   public static void multMatrixf (java.nio.FloatBuffer m)
   {
-    CAMERA.multiply(m);
+    if (cameraOn) {
+      try { CAMERA.multiply(m); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glMultMatrixf(m);
   }
 
   public static void frustum (double l, double r, double b, double t, double n, double f)
   {
-    CAMERA.perspective(l, r, b, t, n, f);
+    if (cameraOn) {
+      try { CAMERA.perspective(l, r, b, t, n, f); } catch (Throwable e) { cameraFailed(e); }
+    }
     GL11.glFrustum(l, r, b, t, n, f);
   }
 
   public static void bindTexture (int target, int texture)
   {
-    CAMERA.bindTexture(texture);
+    if (cameraOn) {
+      try { CAMERA.bindTexture(texture); } catch (Throwable t) { cameraFailed(t); }
+    }
     GL11.glBindTexture(target, texture);
   }
 
   public static void bindBuffer (int target, int buffer)
   {
-    if (target == org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER) CAMERA.bindArray(buffer);
-    else if (target == org.lwjgl.opengl.GL15.GL_ELEMENT_ARRAY_BUFFER) CAMERA.bindElement(buffer);
+    if (cameraOn) {
+      try {
+        if (target == org.lwjgl.opengl.GL15.GL_ARRAY_BUFFER) CAMERA.bindArray(buffer);
+        else if (target == org.lwjgl.opengl.GL15.GL_ELEMENT_ARRAY_BUFFER) CAMERA.bindElement(buffer);
+      } catch (Throwable t) {
+        cameraFailed(t);
+      }
+    }
     org.lwjgl.opengl.GL15.glBindBuffer(target, buffer);
   }
 
   public static void drawRangeElements (int mode, int start, int end, int count, int type, long offset)
   {
     if (depthTest) worldDraws++;
-    CAMERA.draw(mode, start, end, count, type, offset);
+    if (cameraOn) {
+      try { CAMERA.draw(mode, start, end, count, type, offset); } catch (Throwable t) { cameraFailed(t); }
+    }
     org.lwjgl.opengl.GL12.glDrawRangeElements(mode, start, end, count, type, offset);
   }
 
@@ -391,18 +516,25 @@ public final class SkGfxHook
   public static void ortho (double left, double right, double bottom, double top, double near, double far)
   {
     GL11.glOrtho(left, right, bottom, top, near, far);
-    if (CAMERA != null) CAMERA.orthographic();
+    if (cameraOn) {
+      try { CAMERA.orthographic(); } catch (Throwable t) { cameraFailed(t); }
+    }
     if (active && onDefaultFramebuffer && worldDraws >= MIN_WORLD_DRAWS && pipeline != null && !pipeline.inUi()
       && pipeline.matchesWindow(right - left, top - bottom)) {
       try {
         pipeline.beginUi();
-        if (CAMERA != null) CAMERA.endWorld();
+        if (cameraOn) {
+          try { CAMERA.endWorld(); } catch (Throwable t) { cameraFailed(t); }
+        }
         if (!hudAnnounced) {
           hudAnnounced = true;
           System.err.println("[skgfx] HUD layer starts after " + worldDraws + " depth-tested draws");
         }
-        if (pipeline.inUi() && blendSeparate()) {
-          GL14.glBlendFuncSeparate(blendSrc, blendDst, GL11.GL_ONE, GL11.GL_ONE_MINUS_SRC_ALPHA);
+        if (pipeline.inUi()) {
+          // The scene's scaled scissor and the pipeline's real-sized viewport are not what the game believes it has.
+          if (haveViewport) GL11.glViewport(vx, vy, vw, vh);
+          if (haveScissor) GL11.glScissor(sx, sy, sw, sh);
+          applyBlend();
         }
       } catch (Throwable t) {
         disable(t);
@@ -415,10 +547,29 @@ public final class SkGfxHook
   {
     blendSrc = src;
     blendDst = dst;
-    if (inUi() && blendSeparate()) {
-      GL14.glBlendFuncSeparate(src, dst, GL11.GL_ONE, GL11.GL_ONE_MINUS_SRC_ALPHA);
+    applyBlend();
+  }
+
+  /** Alpha blend factors for the HUD layer's coverage: it accumulates, except under additive blending (see below). */
+  static int coverageSrcAlpha (int dst)
+  {
+    return dst == GL11.GL_ONE ? GL11.GL_ZERO : GL11.GL_ONE;
+  }
+
+  static int coverageDstAlpha (int dst)
+  {
+    // Additive light (dst = ONE) adds colour to what is below and covers nothing: alpha is left alone, or the
+    // layer would darken the scene behind every glow by the glow's alpha.
+    return dst == GL11.GL_ONE ? GL11.GL_ONE : GL11.GL_ONE_MINUS_SRC_ALPHA;
+  }
+
+  /** The game's blend function, with coverage alpha while it is drawing the HUD layer (and only then). */
+  private static void applyBlend ()
+  {
+    if (inUi() && onDefaultFramebuffer && blendSeparate()) {
+      GL14.glBlendFuncSeparate(blendSrc, blendDst, coverageSrcAlpha(blendDst), coverageDstAlpha(blendDst));
     } else {
-      GL11.glBlendFunc(src, dst);
+      GL11.glBlendFunc(blendSrc, blendDst);
     }
   }
 
@@ -426,13 +577,23 @@ public final class SkGfxHook
   private static void restoreSceneState ()
   {
     GL11.glBlendFunc(blendSrc, blendDst);
-    if (vw > 0) GL11.glViewport(scaledPos(vx), scaledPos(vy), scaled(vw), scaled(vh));
-    if (sw > 0) GL11.glScissor(scaledPos(sx), scaledPos(sy), scaled(sw), scaled(sh));
+    if (haveViewport) GL11.glViewport(scaledPos(vx), scaledPos(vy), scaledRect(vw, SCALE), scaledRect(vh, SCALE));
+    if (haveScissor) GL11.glScissor(scaledPos(sx), scaledPos(sy), scaledRect(sw, SCALE), scaledRect(sh, SCALE));
   }
 
+  /** The size of a render target for a window dimension (at least 1: a framebuffer cannot be empty). */
   static int scaled (int size)
   {
     return Math.max(1, Math.round(size * SCALE));
+  }
+
+  /**
+   * The size of a viewport or scissor rectangle for the game's. Unlike a target it may be empty: a zero-wide scissor is
+   * how a fully clipped region discards everything, and rounding it up to 1 would let a pixel column through.
+   */
+  static int scaledRect (int size, float scale)
+  {
+    return size <= 0 ? size : Math.max(1, Math.round(size * scale));
   }
 
   private static int scaledPos (int position)
@@ -442,23 +603,32 @@ public final class SkGfxHook
 
   private static void disable (Throwable t)
   {
+    boolean hud = inUi();
     active = false;
+    cameraOn = false;
     System.err.println("[skgfx] disabled after error: " + t);
     t.printStackTrace();
-    if (pipeline != null) {
-      pipeline.dispose();
-      pipeline = null;
+    try {
+      if (pipeline != null) pipeline.release();
+    } catch (Throwable ignored) {
+      // the original error is the one that matters
+    }
+    pipeline = null;
+    // The game carries on drawing straight into the window: with what it believes it has set, not our scaled state.
+    try {
+      onDefaultFramebuffer = true;
+      GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
+      if (hud) GL11.glBlendFunc(blendSrc, blendDst);
+      if (haveViewport) GL11.glViewport(vx, vy, vw, vh);
+      if (haveScissor) GL11.glScissor(sx, sy, sw, sh);
+    } catch (Throwable ignored) {
+      // no usable context: nothing more to put back
     }
   }
 
   private static float floatProp (String key, float fallback)
   {
-    try {
-      String value = System.getProperty(key);
-      return value == null ? fallback : Float.parseFloat(value);
-    } catch (NumberFormatException e) {
-      return fallback;
-    }
+    return (float) SkGfxPacer.finiteOr(System.getProperty(key), fallback);
   }
 
   private static float clamp (float value, float min, float max)
