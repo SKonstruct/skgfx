@@ -131,6 +131,7 @@ public final class SkGfxHook
           double[] phases = FRAME_GEN && p != null && pipeline.canBlend() && SkGfxPipeline.blitAvailable()
             ? p.plan(mayGenerate) : NO_PHASES;
           pipeline.setOverlay(counter, generating(phases));
+          pipeline.flowFrame(phases.length > 0);
           if (phases.length > 0) {
             // The frames to show for this real frame, each the scene at its own phase between the previous real frame
             // and this one (1.0 is this one itself), a gap apart. The last is shown by the swap at the end of this

@@ -50,7 +50,8 @@ With no properties set the agent does nothing visible except the FPS counter.
 | `skgfx.sharpen` | 0 to 1, default 0 | Contrast-adaptive sharpening strength (0 is a plain bilinear fetch). |
 | `skgfx.hudsplit` | `true`/`false` | Draw the HUD in its own transparent layer at full resolution and composite it over the (scaled) scene. |
 | `skgfx.counter` | `false` to disable | FPS counter in the window's top left corner; on by default. |
-| `skgfx.fg` | `true`/`false` | Frame generation prototype (experimental): shows a blend of the previous and current frame between real frames. Implies `skgfx.hudsplit` and `skgfx.stats`. |
+| `skgfx.fg` | `true`/`false` | Frame generation (experimental): shows a generated frame between real frames, made by following per-pixel motion (optical flow) and, without it, the camera's motion or a plain blend. Implies `skgfx.hudsplit` and `skgfx.stats`. |
+| `skgfx.fg.flow` | `true` (default)/`false` | Optical flow for generated frames (fragment shaders, GL 2.1). `false` keeps camera reprojection only. Turns itself off for the session if the GPU or driver rejects it. |
 | `skgfx.fg.multiplier` | 1.1 to 6.0 | Fixed mode: frames shown per real frame. When unset, frame generation is adaptive. |
 | `skgfx.fg.target` | fps, default 0 | Adaptive mode: the frame rate to reach; 0 means the screen's refresh rate. |
 | `skgfx.fg.swapinterval0` | `true` (default)/`false` | Whether frame generation forces `glfwSwapInterval(0)`. |

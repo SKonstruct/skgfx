@@ -255,7 +255,7 @@ final class SkGfxPipeline
     sceneResolvedForUi = false;
   }
 
-  private void drawFullScreenQuad ()
+  static void drawFullScreenQuad ()
   {
     glBegin(GL_QUADS);
     glTexCoord2f(0f, 0f); glVertex2f(-1f, -1f);
@@ -455,6 +455,40 @@ final class SkGfxPipeline
     overlayGenerating = generating;
   }
 
+  /** Optical flow for generated frames; null until first needed, and for good after a failure ({@link #flowOn}). */
+  private SkGfxFlow flow;
+  private static volatile boolean flowOn = SkGfxFlow.ENABLED;
+
+  /**
+   * Once per real frame, after {@link #prepare}: reduces this frame to its luma pyramid and, when generated frames
+   * follow, solves the flow from the previous real frame. Any failure turns flow off for good; frame generation goes on
+   * with camera reprojection or blending.
+   */
+  void flowFrame (boolean generating)
+  {
+    if (!flowOn || !SkGfxHook.FRAME_GEN || !blitAvailable()) return;
+    try {
+      if (flow == null) flow = new SkGfxFlow();
+      flow.analyze(colorTexture, scaledWidth, scaledHeight);
+      if (generating) flow.solve();
+    } catch (Throwable t) {
+      flowFailed(t);
+    }
+  }
+
+  private void flowFailed (Throwable t)
+  {
+    System.err.println("[skgfx] optical flow stopped after error: " + t);
+    flowOn = false;
+    try {
+      if (flow != null) flow.release();
+    } catch (Throwable ignored) {
+      // the context may be gone; the objects go with it
+    }
+    flow = null;
+    while (glGetError() != GL_NO_ERROR) { } // not the game's
+  }
+
   /** Whether the previous frame is available to blend with. */
   boolean canBlend ()
   {
@@ -487,6 +521,7 @@ final class SkGfxPipeline
     // overlay) must find the window bound.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     historyValid = true;
+    if (flow != null) flow.swap();
   }
 
   /**
@@ -504,7 +539,8 @@ final class SkGfxPipeline
     // The camera as it was at this phase between the two real frames: where the scene's points are seen from there,
     // relative to the previous frame's camera (toPrev) and the current one (toCur).
     double[] toCur = null, toPrev = null;
-    if (blend < 1f && camera != null && camera.valid() && depthTexture != 0 && historyValid) {
+    boolean flowReady = blend < 1f && flow != null && flow.solved() && historyValid;
+    if (!flowReady && blend < 1f && camera != null && camera.valid() && depthTexture != 0 && historyValid) {
       double[] before = SkGfxCamera.step(camera.delta(), blend);
       double[] after = SkGfxCamera.step(camera.delta(), 1.0 - blend);
       if (before != null && after != null) {
@@ -526,13 +562,14 @@ final class SkGfxPipeline
       glColorMask(true, true, true, true);
       glViewport(0, 0, realWidth, realHeight);
 
-      if (toCur != null && toPrev != null) {
+      if (flowReady || (toCur != null && toPrev != null)) {
         boolean sharpen = SkGfxHook.SHARPEN > 0f;
         if (sharpen) {
           ensureGen();
           glBindFramebuffer(GL_FRAMEBUFFER, genFramebuffer);
         }
-        useReprojection(toCur, toPrev, camera.projection(), blend);
+        if (flowReady) flow.useWarp(blend, colorTexture, historyTexture);
+        else useReprojection(toCur, toPrev, camera.projection(), blend);
         drawFullScreenQuad();
         if (sharpen) {
           // The reprojected frame is sharpened like a real one: second pass over it, at window resolution.
@@ -747,6 +784,7 @@ final class SkGfxPipeline
     disposeUi();
     if (historyFramebuffer != 0) { glDeleteFramebuffers(historyFramebuffer); historyFramebuffer = 0; }
     if (historyTexture != 0) { glDeleteTextures(historyTexture); historyTexture = 0; }
+    if (flow != null) flow.dispose();
     historyValid = false;
     hasFrame = false;
   }
@@ -758,6 +796,7 @@ final class SkGfxPipeline
     if (program != 0) { glDeleteProgram(program); program = 0; }
     if (uiProgram != 0) { glDeleteProgram(uiProgram); uiProgram = 0; }
     if (reprojProgram != 0) { glDeleteProgram(reprojProgram); reprojProgram = 0; }
+    if (flow != null) { flow.release(); flow = null; }
   }
 
   /** What the GL context in use right now has to say about blit support is asked again in a new context. */
@@ -805,7 +844,7 @@ final class SkGfxPipeline
       """);
   }
 
-  private static final String VERTEX_SOURCE = """
+  static final String VERTEX_SOURCE = """
     #version 120
     void main() {
       gl_Position = vec4(gl_Vertex.xy, 0.0, 1.0);
@@ -814,7 +853,7 @@ final class SkGfxPipeline
     """;
 
   /** Compiles and links a program from a vertex and a fragment source; nothing is left behind when either fails. */
-  private static int program (String vertexSource, String fragmentSource)
+  static int program (String vertexSource, String fragmentSource)
   {
     int vertex = compile(GL_VERTEX_SHADER, vertexSource);
     int fragment;
