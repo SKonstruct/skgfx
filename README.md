@@ -32,6 +32,12 @@ cd desktop
 This uses the bundled Apache Maven Wrapper (`mvnw.cmd` on Windows) and needs only a JDK 24 or newer on `JAVA_HOME` or `PATH` (CI builds with 25).
 The jar is written to `desktop/target/skgfx-agent.jar`.
 
+### Release
+
+Pushing a tag `v<version>` (the version in `desktop/pom.xml`) runs the tests on all three systems, then publishes
+`skgfx-agent.jar` and `SHA256SUMS.txt` as a GitHub Release. A published release is never replaced: SKradle's signed
+module index pins the jar's URL and SHA-256, so a fix gets a new version and tag.
+
 ### Use
 
 Add the agent and the properties you want to the game's JVM arguments:
